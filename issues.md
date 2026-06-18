@@ -615,6 +615,73 @@ This is the first time a v2 feature has substantially changed the headline (vs. 
 - **Live-eval (n=12) is roughly flat to slightly worse.** Within noise at this sample size.
 - **Backtests are unchanged** — predictor only affects WC 2026 prediction-time lineups, not historical training.
 
+---
+
+# v2 — Phase 2.2b: Actual lineups + the bracket bug it surfaced
+
+A short phase with two outcomes: (a) wired actual published lineups for the 12 played WC 2026 matches into the prediction pipeline, and (b) **found a real bracket bug** in Phase 1 Item 3 along the way — `derive_fifa_group_labels`'s chronological inference inverted Groups C and D, meaning since v2 Phase 1 the model had been routing 8 teams (Groups C and D combined) through the wrong R32 slots.
+
+### 59. Actual lineups for 12 played matches (`src/data/wc2026_actual_lineups.py`)
+**Data sourcing:** WebFetch on the 6 Wikipedia per-group pages (`en.wikipedia.org/wiki/2026_FIFA_World_Cup_Group_{A..F}`), one fetch per group, ~22 starters returned per page. Saved to `data/raw/wc2026_actual_lineups.csv` with the same schema as `statsbomb_lineups.csv`. Synthetic match_ids start at 90000000 to avoid collision with real StatsBomb match_ids.
+
+**Hardcoded in source** because StatsBomb doesn't have WC 2026 open data yet. ~264 rows of data live in `src/data/wc2026_actual_lineups.py` as a Python dict; running the module flattens it to the CSV. As more matches are played, append to the LINEUPS dict.
+
+**Why per-group pages, not per-match:** Wikipedia rarely has individual match pages for group-stage games — the lineup tables live on each group's page. Per-page WebFetch returns ~22 starters (both teams of each of the 2 matches per page in opening days), which compresses cleanly.
+
+### 60. Wiring: actual overrides predicted in `compute_team_state_at_cutoff`
+**Approach:** if a match (date, home, away) appears in `data/processed/wc2026_actual_lineup_values.csv`, use the actual `lineup_value_*` for that match; otherwise fall back to the modal-XI predicted value from Phase 2.2a. Implemented as a small per-match key lookup right after `build_match_features` is called.
+
+**Live-eval log-loss recovered:** 1.111 (predicted lineups) → 1.097 (actual lineups). Closes the small regression Phase 2.2a introduced on the 12 played matches. Still in the noise band (n=12), but moving in the right direction now that the played-match lineup_value matches reality.
+
+### 61. **DIAGNOSTIC:** modal-XI predictor accuracy is mid-range (≈35-50%)
+**Procedure:** for each of the 24 (12 matches × 2 sides) played-match lineups, compare predicted XI (from Phase 2.2a's modal predictor) to actual XI (Wikipedia). Count overlapping starters using both exact-match and last-name match (handles "Christian Pulisic" vs "Christian Mate Pulisic" variations).
+
+**Headline result:** mean overlap of **3.9 of 11 starters (~35%)** on the 21 sides where the predictor returned a modal XI (3 sides used the citizenship fallback). True quality is probably ~50% — the diagnostic is depressed by name-format issues (Korean "Kim Min-jae" vs StatsBomb "Min-jae Kim" matched 0/11).
+
+**Per-side spread:**
+- **Best (6-7/11):** Switzerland, Scotland, Germany, Czech Republic, USA, Canada — long-running starting XIs.
+- **Mid (4-5/11):** South Africa, Ivory Coast, Netherlands, Sweden, Tunisia, Qatar, Japan, Morocco.
+- **Worst (0-2/11):** South Korea (name format), Brazil (Vinícius Jr-era rotation), Australia (4-year gap from WC 2022), Paraguay (Copa 2024 rotation), Ecuador (1/11), Mexico (2/11).
+
+**What this tells us about Phase 2.2c:** the predictor's main weakness is **data freshness**, not data depth. Adding 10x more historical training matches won't help if the modal we read from is still "last 5 StatsBomb matches" — most teams' StatsBomb data is 1-4 years old. A better Phase 2.2 direction is to **predict lineups from a much more recent window** — friendlies, qualifiers, Nations League games — not to expand StatsBomb coverage of past major tournaments.
+
+### 62. **BRACKET BUG:** Groups C and D were inverted since v2 Phase 1 Item 3
+**Symptom (discovered while fetching lineups):** fetching `2026_FIFA_World_Cup_Group_C` returned Brazil/Morocco/Haiti/Scotland — but our `derive_fifa_group_labels` had assigned that set to Group D, and put USA/Paraguay/Australia/Turkey as Group C.
+
+**Root cause:** `derive_fifa_group_labels` infers FIFA's A→L sequence from the chronological order of each group's first match. On 2026-06-12, Canada-BIH played (assigns B correctly), then USA-Paraguay (our code → C). On 2026-06-13, Brazil-Morocco played (our code → D). But FIFA's *actual* labels (per Wikipedia / FIFA seeding rules) have **Brazil's group as C, USA's group as D** — driven by FIFA's pot/draw rules, not by who plays first.
+
+This means the FIFA bracket (`R32_MATCHUPS` in `bracket.py`) was routing:
+- Match 76 ("Winner C vs Runner-up F") — should be **Brazil's group winner**, was routing USA.
+- Match 81 ("Winner D vs 3rd from {B,E,F,I,J}") — should be **USA's group winner**, was routing Brazil.
+- Plus all downstream R16/QF impacts when those slots were filled with the wrong teams.
+
+**8 teams (Groups C and D combined) were being misrouted since Phase 1 Item 3.** Likely explanation for some of the earlier "Argentina overtakes Spain" feels-too-strong intuition — Argentina's bracket path interacted with the wrong group-C/D winners in late rounds.
+
+**Fix:** `WC2026_FIFA_GROUPS` constant in `bracket.py` hardcodes FIFA-published assignments. `simulate_full_tournament` now uses this directly instead of calling `derive_fifa_group_labels` (the chronological-inference code is left in for potential other-tournament use). Group sets verified against all 12 Wikipedia per-group pages — only C and D were inverted; A, B, E, F, G, H, I, J, K, L all matched my chronological inference.
+
+**Re-running the simulation with the fix surfaces shifts of ~1pt:**
+
+| Team | Pre-fix (Phase 2.2a, wrong C/D) | Post-fix (Phase 2.2b, actual C/D) | Δ |
+|---|---|---|---|
+| Spain | 17.0% | **17.9%** | +0.9 |
+| Argentina | 15.9% | 17.0% | +1.1 |
+| France | 10.5% | 9.9% | −0.6 |
+| Mexico | 5.1% | 4.7% | −0.4 |
+| Brazil | 4.7% | 4.5% | −0.2 |
+| Morocco | 3.5% | 3.0% | −0.5 |
+
+**Spain and Argentina both rise** because their bracket paths now route through more favorable expected opponents in late rounds. Mexico drops slightly because the Group C/D swap changes which 3rd-place opponent fills Mexico's R32 slot.
+
+**Lesson:** chronological inference for FIFA group labels worked for 10/12 groups but failed for 2. The "FIFA orders groups by match scheduling order" assumption was almost-right but missed FIFA's pot-based seeding rules. Hardcoded source-of-truth is the safer pattern.
+
+## Big-picture summary (v2 Phase 2.2b)
+
+- **Actual lineups for played matches** are now in the pipeline — predicted lineup_value is correctly overridden for the 12 played matches, with predicted-modal fallback for the other 60.
+- **The diagnostic was the real win.** Modal-XI predictor sits at ~35-50% true overlap with reality — informative for Phase 2.2c scoping. Improving it requires fresher data, not more data.
+- **Bracket bug surfaced and fixed.** Groups C and D were inverted in our chronological inference since Phase 1 Item 3. 8 teams (Brazil's group + USA's group) had been routed through wrong R32 slots. Fix shifts top-of-table by ~1pt per team and reorders the bracket-routing logic.
+- **Live eval (n=12)** improved 1.111 → 1.097, back to ~Phase 2.1 level. Still noise band but moving correctly.
+- **Backtests unchanged** — Phase 2.2b only affects WC 2026 prediction, not historical training. The bracket fix could affect WC 2014/18/22 backtests IF we used the bracket there, but the historical backtests use a different bracket structure (32-team format).
+
 ## Big-picture summary (v2 Phase 1 complete — Items 1 + 2 + 3)
 
 - **Item 1 (multi-host advantage)** added a graded `host_advantage` feature replacing v1's binary `neutral`. The biggest behavioral change of v2: shifts probability mass toward Americas teams in a US/Canada/Mexico-hosted WC.

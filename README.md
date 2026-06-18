@@ -13,8 +13,9 @@ ML model that predicts FIFA World Cup 2026 match outcomes (W/D/L), exact scores,
 | **v2 — Refinements** | CAF↔AFC adjacency fixes the Qatar 2022 backtest regression. Per-venue knockout cache routes Mexico through correct host-advantage + altitude at Azteca knockouts (Mexico's P(win WC) +1.1pt). Plus a 47-check invariant suite (`tests/check_v2_invariants.py`) to catch silent-off-by-N regressions. | shipped |
 | v2 — Phase 1 follow-ups | Per-host learned home-advantage coefficients (Mexico's Azteca ≠ Liechtenstein's home crowd). | deferred |
 | **v2 — Phase 2.1** | Lineup-aware starting-XI market value (`lineup_value_home/away`) from StatsBomb open data (314 internationals: WC 2018/22, Euro 20/24, Copa 24, AFCON 23). WC 2022 backtest improved 1.1001 → 1.0914. WC 2026 forecast unchanged (no StatsBomb coverage). | shipped |
-| **v2 — Phase 2.2a** | Modal-XI lineup predictor for WC 2026 — each qualifier's predicted starting XI = top-11 by appearance count over last 5 StatsBomb matches; citizenship-top-11 fallback for teams with no coverage. Unlocks the lineup_value feature for the WC 2026 forecast. Spain returns to #1, France jumps to #3. | shipped |
-| v2 — Phase 2.2b/c/d | Actual lineups for 12 played WC 2026 matches; expand training-data coverage 10x; per-player ratings; position-weighted aggregation. | not started |
+| **v2 — Phase 2.2a** | Modal-XI lineup predictor for WC 2026 — each qualifier's predicted starting XI = top-11 by appearance count over last 5 StatsBomb matches; citizenship-top-11 fallback for teams with no coverage. Unlocks the lineup_value feature for the WC 2026 forecast. | shipped |
+| **v2 — Phase 2.2b** | Actual lineups for the 12 played WC 2026 matches (Wikipedia per-group pages) override predicted values. Diagnostic: modal-XI predictor matches ~35-50% of actual starters per side — informative for Phase 2.2c scoping. ALSO surfaced a bracket bug: Groups C and D were inverted since Phase 1 Item 3 (chronological inference vs FIFA seeding). Fix routes 8 teams through correct R32 slots; Spain and Argentina both rise ~1pt. | shipped |
+| v2 — Phase 2.2c/d | Expand training-data coverage 10x; per-player ratings; position-weighted aggregation. | not started |
 | v3 | Hypothetical follow-up (calibration, tournament scope expansion). | not defined |
 
 See `issues.md` for the engineering log of both versions.
@@ -200,25 +201,25 @@ For a beginner who wants to *understand* the model, read `docs/` in order. For a
 
 ---
 
-## Headline result (v2 through Phase 2.2a)
+## Headline result (v2 through Phase 2.2b)
 
 After all the work, what does the model say about WC 2026?
 
 | # | Team | P(win WC) | Δ vs v1 |
 |---|---|---|---|
-| 1 | 🇪🇸 Spain | **17.0%** | −1.8 |
-| 2 | 🇦🇷 Argentina | 15.9% | +1.3 |
-| 3 | 🇫🇷 France | **10.5%** | −1.0 |
-| 4 | 🏴 England | 9.3% | −3.3 |
-| 5 | 🇲🇽 Mexico | **5.1%** | +3.2 |
-| 6 | 🇧🇷 Brazil | 4.7% | +0.6 |
+| 1 | 🇪🇸 Spain | **17.9%** | −0.9 |
+| 2 | 🇦🇷 Argentina | 17.0% | +2.4 |
+| 3 | 🇫🇷 France | 9.9% | −1.6 |
+| 4 | 🏴 England | 9.2% | −3.4 |
+| 5 | 🇲🇽 Mexico | **4.7%** | +2.8 |
+| 6 | 🇧🇷 Brazil | 4.5% | +0.4 |
 | 7 | 🇵🇹 Portugal | 4.0% | −0.7 |
-| 8 | 🇳🇱 Netherlands | 3.7% | −0.5 |
-| 9 | 🇩🇪 Germany | 3.5% | −0.7 |
-| 10 | 🇲🇦 Morocco | 3.5% | +0.1 |
-| 11 | 🇨🇴 Colombia | 3.4% | new top-11 |
+| 8 | 🇩🇪 Germany | 3.5% | −0.7 |
+| 9 | 🇨🇴 Colombia | 3.3% | new top-11 |
+| 10 | 🇳🇱 Netherlands | 3.2% | −1.0 |
+| 11 | 🇲🇦 Morocco | 3.0% | −0.4 |
 
-**Spain is #1, Mexico in the top 5.** The full v2 stack — graded host advantage, altitude, FIFA bracket, per-venue knockout cache, and Phase 2.2a's modal-XI lineup prediction — combines to shift probabilities meaningfully from where v1 left them.
+**Spain is #1, Argentina close behind, Mexico in the top 5.** The full v2 stack — graded host advantage, altitude, FIFA bracket (with the Group C/D fix from 2.2b), per-venue knockout cache, modal-XI lineup prediction with actual-lineup override for played matches — combines to shift probabilities meaningfully from where v1 left them.
 
 Five effects compound across the v2 work:
 1. **Item 1** (graded host advantage + CAF↔AFC refinement) — Americas teams gain across all WC 2026 matches.
@@ -256,9 +257,9 @@ Top 4 cover ~52% of championship probability. See `issues.md` items #25–58 for
 
 ### v2 — Phase 2
 - [x] **Phase 2.1 — Lineup-aware starting-XI value** (`src/data/lineups_loader.py` + `src/features/lineup_values.py`). 314 international matches from StatsBomb open data → `lineup_value_home/away` features. WC 2022 backtest improved 1.1001 → 1.0914 (Cameroon-Brazil 2022 type misses softened). WC 2026 forecast unchanged (no StatsBomb coverage). See issues #46–52.
-- [x] **Phase 2.2a — Modal-XI lineup predictor for WC 2026** (`src/features/lineup_predictor.py`). For each qualifier: predicted XI = top-11 by appearance count over last 5 StatsBomb matches; citizenship-top-11 fallback for teams without StatsBomb coverage (32 modal_xi / 16 citizenship / 0 NaN). First v2 feature to move the WC 2026 headline by 2+ percentage points: Spain back to #1 at 17.0%, France jumps to 10.5%. See issues #53–58.
-- [ ] Phase 2.2b — Actual lineups for the 12 played WC 2026 matches (Wikipedia/news scraping).
-- [ ] Phase 2.2c — Expand training-data lineup coverage 10x via Wikipedia/FBRef.
+- [x] **Phase 2.2a — Modal-XI lineup predictor for WC 2026** (`src/features/lineup_predictor.py`). For each qualifier: predicted XI = top-11 by appearance count over last 5 StatsBomb matches; citizenship-top-11 fallback for teams without StatsBomb coverage (32 modal_xi / 16 citizenship / 0 NaN). First v2 feature to move the WC 2026 headline by 2+ percentage points. See issues #53–58.
+- [x] **Phase 2.2b — Actual lineups + bracket bug fix** (`src/data/wc2026_actual_lineups.py`). 264 starter rows from Wikipedia per-group pages for the 12 played matches override predicted values. **Diagnostic finding:** modal-XI predictor matches ~35-50% of actual starters per side (informative for Phase 2.2c scoping). **Bracket bug surfaced:** Groups C and D were inverted since Phase 1 Item 3 (chronological vs FIFA seeding). Fix in `bracket.py:WC2026_FIFA_GROUPS`. See issues #59–62.
+- [ ] Phase 2.2c — Expand training-data lineup coverage with fresher recent matches (NOT just StatsBomb expansion — modal-XI diagnostic shows freshness > volume).
 - [ ] Phase 2.2d — Per-player ratings (replace market value with FBRef/club-Elo) + position-weighted aggregation.
 
 ### v2 — Phase 3 (polish)

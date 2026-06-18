@@ -120,6 +120,31 @@ FINAL_FEEDERS: tuple[int, int] = (101, 102)
 # Used by the simulator's per-venue knockout lambda cache to route
 # host-advantage and altitude features correctly through each knockout.
 
+# ---- FIFA-published WC 2026 group assignments (Wikipedia per-group pages) ----
+#
+# Replaces the chronological inference in `derive_fifa_group_labels`, which
+# inverted Groups C and D (USA's group should be D, Brazil's should be C —
+# FIFA's seeding chooses the order, not match scheduling). Bug surfaced
+# in v2 Phase 2.2b when fetching Wikipedia lineups: Group C's page had
+# Brazil/Morocco/Haiti/Scotland while our derive_fifa_group_labels had put
+# them as Group D. Bracket was routing 8 teams (Groups C and D combined)
+# through wrong R32 slots since Phase 1 Item 3.
+WC2026_FIFA_GROUPS: dict[str, frozenset[str]] = {
+    "A": frozenset({"Mexico", "South Africa", "South Korea", "Czech Republic"}),
+    "B": frozenset({"Canada", "Bosnia and Herzegovina", "Qatar", "Switzerland"}),
+    "C": frozenset({"Brazil", "Morocco", "Haiti", "Scotland"}),
+    "D": frozenset({"United States", "Paraguay", "Australia", "Turkey"}),
+    "E": frozenset({"Germany", "Curaçao", "Ivory Coast", "Ecuador"}),
+    "F": frozenset({"Netherlands", "Japan", "Sweden", "Tunisia"}),
+    "G": frozenset({"Belgium", "Egypt", "Iran", "New Zealand"}),
+    "H": frozenset({"Spain", "Cape Verde", "Saudi Arabia", "Uruguay"}),
+    "I": frozenset({"France", "Senegal", "Iraq", "Norway"}),
+    "J": frozenset({"Argentina", "Algeria", "Austria", "Jordan"}),
+    "K": frozenset({"Portugal", "DR Congo", "Uzbekistan", "Colombia"}),
+    "L": frozenset({"England", "Croatia", "Ghana", "Panama"}),
+}
+
+
 KNOCKOUT_VENUES: dict[int, tuple[str, str]] = {
     # R32 (73-88)
     73: ("Inglewood", "United States"),

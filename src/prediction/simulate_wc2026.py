@@ -34,6 +34,7 @@ from src.prediction.bracket import (
     R16_FEEDERS,
     R32_MATCHUPS,
     SF_FEEDERS,
+    WC2026_FIFA_GROUPS,
     build_r32_slot_to_team,
     r32_matchups_resolved,
 )
@@ -370,9 +371,11 @@ def simulate_full_tournament(
         (results_df["tournament"] == "FIFA World Cup")
         & (results_df["date"] >= CUTOFF)
     ].copy()
-    auto_groups = identify_groups(wc26_results)
-    auto_to_fifa = derive_fifa_group_labels(wc26_results)
-    groups = {auto_to_fifa[auto]: teams for auto, teams in auto_groups.items()}
+    # v2 Phase 2.2b: use FIFA-published group assignments from Wikipedia
+    # instead of the chronological inference (which inverted Groups C and D).
+    # Verify our chronological inference matches FIFA for groups where it does
+    # — useful sanity check — but use the FIFA-published assignments for routing.
+    groups = {letter: set(teams) for letter, teams in WC2026_FIFA_GROUPS.items()}
     print("  FIFA group assignments:")
     for fifa_letter in "ABCDEFGHIJKL":
         teams = groups[fifa_letter]

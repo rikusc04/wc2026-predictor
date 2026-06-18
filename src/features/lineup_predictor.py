@@ -41,6 +41,7 @@ from src.features.squad_values import (
     _build_player_value_lookup,
     _build_tm_name_index,
     _citizenship_top26_at,
+    _normalize,
     _player_value_at,
 )
 from src.features.lineup_values import _match_starter
@@ -48,9 +49,11 @@ from src.features.lineup_values import _match_starter
 
 TM_DIR = PROJECT_ROOT / "data" / "raw" / "transfermarkt"
 LINEUPS_PATH = PROJECT_ROOT / "data" / "raw" / "statsbomb_lineups.csv"
+ACTUAL_LINEUPS_PATH = PROJECT_ROOT / "data" / "raw" / "wc2026_actual_lineups.csv"
 SB_TO_TM_PATH = PROJECT_ROOT / "data" / "processed" / "sb_player_to_tm.csv"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 OUTPUT_PATH = PROCESSED_DIR / "wc2026_predicted_lineup_values.csv"
+ACTUAL_LINEUP_VALUES_PATH = PROCESSED_DIR / "wc2026_actual_lineup_values.csv"
 
 WC_2026_KICKOFF = date(2026, 6, 11)
 LAST_K_MATCHES = 5
@@ -213,6 +216,132 @@ def build_wc2026_predictions(snapshot_date: date = WC_2026_KICKOFF) -> pd.DataFr
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     out.to_csv(OUTPUT_PATH, index=False)
     return out
+
+
+def build_actual_lineup_values(snapshot_date: date = WC_2026_KICKOFF) -> pd.DataFrame:
+    """Compute per-(match, side) lineup_value for the 12 played WC 2026 matches.
+
+    Uses actual lineups from data/raw/wc2026_actual_lineups.csv (Wikipedia-sourced,
+    hardcoded in src/data/wc2026_actual_lineups.py). Same TM-matching shape as
+    lineup_values.py for StatsBomb data.
+    """
+    if not ACTUAL_LINEUPS_PATH.exists():
+        raise FileNotFoundError(
+            f"{ACTUAL_LINEUPS_PATH} not found. "
+            f"Run `python -m src.data.wc2026_actual_lineups` first."
+        )
+
+    actual = pd.read_csv(ACTUAL_LINEUPS_PATH)
+    print(f"loaded {len(actual):,} actual starter rows from "
+          f"{actual['match_id'].nunique()} played WC 2026 matches")
+
+    players = pd.read_csv(TM_DIR / "players.csv")
+    valuations = pd.read_csv(TM_DIR / "player_valuations.csv")
+    tm_index = _build_tm_name_index(players)
+    fuzzy_candidates = list(tm_index.keys())
+    valuations_by_player = _build_player_value_lookup(valuations)
+
+    # Match each actual starter to a TM player_id and look up their value
+    rows = []
+    for (date_str, home, away, side), grp in actual.groupby(
+        ["match_date", "home_team", "away_team", "side"]
+    ):
+        values: list[float] = []
+        starter_names = []
+        for _, r in grp.iterrows():
+            tm_id = _match_starter(
+                r["player_name"], r["player_nickname"] or "",
+                tm_index, fuzzy_candidates,
+            )
+            starter_names.append(r["player_name"])
+            if tm_id is None:
+                continue
+            v = _player_value_at(int(tm_id), snapshot_date, valuations_by_player)
+            if v is not None:
+                values.append(v)
+
+        rows.append({
+            "match_date": date_str,
+            "home_team": home,
+            "away_team": away,
+            "side": side,
+            "lineup_value_eur": sum(values) if values else None,
+            "n_starters_matched": len(values),
+            "n_starters_total": len(grp),
+        })
+
+    out = pd.DataFrame(rows)
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_csv(ACTUAL_LINEUP_VALUES_PATH, index=False)
+    return out
+
+
+def overlap_diagnostic() -> pd.DataFrame:
+    """For each played match, compare predicted XI to actual XI by player-name overlap.
+
+    Returns per-match table with predicted_xi_count, actual_xi_count, overlap_n.
+    Overall mean is the diagnostic of how good the modal-XI heuristic is.
+    """
+    actual = pd.read_csv(ACTUAL_LINEUPS_PATH)
+    actual["match_date"] = actual["match_date"].astype(str)
+
+    lineups = pd.read_csv(LINEUPS_PATH)
+    lineups["match_date"] = pd.to_datetime(lineups["match_date"])
+
+    players = pd.read_csv(TM_DIR / "players.csv")
+    sb_to_tm = _build_sb_to_tm_cache(lineups, players)
+
+    rows = []
+    for (date_str, home, away), grp in actual.groupby(
+        ["match_date", "home_team", "away_team"]
+    ):
+        snapshot = pd.Timestamp(date_str).date()
+        for team_label, team in [("home", home), ("away", away)]:
+            actual_xi_names = set(
+                grp[grp["side"] == team_label]["player_name"]
+                .astype(str)
+                .map(_normalize)
+            )
+
+            # Get predicted XI for this team at the snapshot
+            sb_pids = predict_starting_xi(team, snapshot, lineups)
+            if sb_pids is None:
+                predicted_xi_names: set[str] = set()
+                source = "fallback"
+            else:
+                source = "modal_xi"
+                predicted_xi_names = set()
+                for sb_pid in sb_pids:
+                    p = lineups[lineups["player_id"] == sb_pid].iloc[0]
+                    predicted_xi_names.add(_normalize(p["player_name"]))
+
+            # Use first-word + last-word matching to handle "Christian Pulisic" vs
+            # "Christian Mate Pulisic" type variations
+            def matches(a, b):
+                if a == b:
+                    return True
+                a_parts = a.split()
+                b_parts = b.split()
+                # Last-name match if at least 2-token names
+                if a_parts and b_parts and a_parts[-1] == b_parts[-1]:
+                    return True
+                return False
+
+            overlap = sum(
+                1 for ap in actual_xi_names
+                if any(matches(ap, pp) for pp in predicted_xi_names)
+            )
+
+            rows.append({
+                "match_date": date_str,
+                "team": team,
+                "actual_count": len(actual_xi_names),
+                "predicted_count": len(predicted_xi_names),
+                "overlap": overlap,
+                "source": source,
+            })
+
+    return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":

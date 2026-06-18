@@ -205,13 +205,35 @@ def predict_wc_2026() -> tuple[pd.DataFrame, object]:
 
     print()
     print("building per-match feature rows...")
-    feature_rows = [
-        build_match_features(
+    # v2 Phase 2.2b: for the 12 already-played matches, override the predicted
+    # lineup_value with the actual starting-XI value from Wikipedia.
+    actual_lv_path = PROCESSED_DIR / "wc2026_actual_lineup_values.csv"
+    actual_lv: dict[tuple, tuple[float | None, float | None]] = {}
+    if actual_lv_path.exists():
+        alv = pd.read_csv(actual_lv_path)
+        for (mdate, h, a), grp in alv.groupby(["match_date", "home_team", "away_team"]):
+            home_row = grp[grp["side"] == "home"]
+            away_row = grp[grp["side"] == "away"]
+            actual_lv[(str(mdate), h, a)] = (
+                float(home_row["lineup_value_eur"].iloc[0]) if len(home_row) and pd.notna(home_row["lineup_value_eur"].iloc[0]) else None,
+                float(away_row["lineup_value_eur"].iloc[0]) if len(away_row) and pd.notna(away_row["lineup_value_eur"].iloc[0]) else None,
+            )
+
+    feature_rows = []
+    for _, m in wc26.iterrows():
+        feats = build_match_features(
             m["home_team"], m["away_team"], m["date"], m["country"], state,
             match_city=m["city"],
         )
-        for _, m in wc26.iterrows()
-    ]
+        # Override predicted lineup_value with actual when this match has been played
+        key = (m["date"].strftime("%Y-%m-%d"), m["home_team"], m["away_team"])
+        if key in actual_lv:
+            actual_h, actual_a = actual_lv[key]
+            if actual_h is not None:
+                feats["lineup_value_home"] = actual_h
+            if actual_a is not None:
+                feats["lineup_value_away"] = actual_a
+        feature_rows.append(feats)
     features_df = pd.DataFrame(feature_rows)
 
     print()
