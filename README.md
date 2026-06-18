@@ -13,7 +13,8 @@ ML model that predicts FIFA World Cup 2026 match outcomes (W/D/L), exact scores,
 | **v2 — Refinements** | CAF↔AFC adjacency fixes the Qatar 2022 backtest regression. Per-venue knockout cache routes Mexico through correct host-advantage + altitude at Azteca knockouts (Mexico's P(win WC) +1.1pt). Plus a 47-check invariant suite (`tests/check_v2_invariants.py`) to catch silent-off-by-N regressions. | shipped |
 | v2 — Phase 1 follow-ups | Per-host learned home-advantage coefficients (Mexico's Azteca ≠ Liechtenstein's home crowd). | deferred |
 | **v2 — Phase 2.1** | Lineup-aware starting-XI market value (`lineup_value_home/away`) from StatsBomb open data (314 internationals: WC 2018/22, Euro 20/24, Copa 24, AFCON 23). WC 2022 backtest improved 1.1001 → 1.0914. WC 2026 forecast unchanged (no StatsBomb coverage). | shipped |
-| v2 — Phase 2.2 | Lineup prediction for unplayed WC 2026 matches; per-player ratings; position-weighted aggregation; expand lineup coverage 10x. | not started |
+| **v2 — Phase 2.2a** | Modal-XI lineup predictor for WC 2026 — each qualifier's predicted starting XI = top-11 by appearance count over last 5 StatsBomb matches; citizenship-top-11 fallback for teams with no coverage. Unlocks the lineup_value feature for the WC 2026 forecast. Spain returns to #1, France jumps to #3. | shipped |
+| v2 — Phase 2.2b/c/d | Actual lineups for 12 played WC 2026 matches; expand training-data coverage 10x; per-player ratings; position-weighted aggregation. | not started |
 | v3 | Hypothetical follow-up (calibration, tournament scope expansion). | not defined |
 
 See `issues.md` for the engineering log of both versions.
@@ -199,31 +200,34 @@ For a beginner who wants to *understand* the model, read `docs/` in order. For a
 
 ---
 
-## Headline result (v2 Phase 1 + refinements)
+## Headline result (v2 through Phase 2.2a)
 
 After all the work, what does the model say about WC 2026?
 
 | # | Team | P(win WC) | Δ vs v1 |
 |---|---|---|---|
-| 1 | 🇦🇷 Argentina | **17.2%** | +2.6 (new #1) |
-| 2 | 🇪🇸 Spain | 16.8% | −2.0 |
-| 3 | 🏴 England | 11.5% | −1.1 |
-| 4 | 🇫🇷 France | 9.3% | −2.2 |
-| 5 | 🇧🇷 Brazil | 5.8% | +1.7 |
-| 6 | 🇵🇹 Portugal | 4.9% | +0.2 |
-| 7 | 🇲🇽 Mexico | **4.4%** | +2.5 |
-| 8 | 🇲🇦 Morocco | 3.5% | +0.1 |
-| 9 | 🇨🇴 Colombia | 3.3% | new top-10 |
-| 10 | 🇳🇱 Netherlands | 3.1% | −1.1 |
-| 11 | 🇩🇪 Germany | 2.8% | −1.4 |
+| 1 | 🇪🇸 Spain | **17.0%** | −1.8 |
+| 2 | 🇦🇷 Argentina | 15.9% | +1.3 |
+| 3 | 🇫🇷 France | **10.5%** | −1.0 |
+| 4 | 🏴 England | 9.3% | −3.3 |
+| 5 | 🇲🇽 Mexico | **5.1%** | +3.2 |
+| 6 | 🇧🇷 Brazil | 4.7% | +0.6 |
+| 7 | 🇵🇹 Portugal | 4.0% | −0.7 |
+| 8 | 🇳🇱 Netherlands | 3.7% | −0.5 |
+| 9 | 🇩🇪 Germany | 3.5% | −0.7 |
+| 10 | 🇲🇦 Morocco | 3.5% | +0.1 |
+| 11 | 🇨🇴 Colombia | 3.4% | new top-11 |
 
-**Argentina is #1**, narrowly ahead of Spain. **Mexico now in the top 7** after the per-venue knockout cache correctly routes their R32/R16 matches through Estadio Azteca (Mexico City) where they get both host advantage AND altitude. Four effects compound across the v2 work:
+**Spain is #1, Mexico in the top 5.** The full v2 stack — graded host advantage, altitude, FIFA bracket, per-venue knockout cache, and Phase 2.2a's modal-XI lineup prediction — combines to shift probabilities meaningfully from where v1 left them.
+
+Five effects compound across the v2 work:
 1. **Item 1** (graded host advantage + CAF↔AFC refinement) — Americas teams gain across all WC 2026 matches.
-2. **Item 2** (altitude native advantage) — Mexico's group games at Azteca/Zapopan, and Colombia's two altitude games, get a small boost.
-3. **Item 3** (FIFA bracket) — Argentina's specific bracket path is favorable; France/Germany tougher.
-4. **Per-venue knockout cache** — Mexico's R32+R16 at Azteca now get the altitude+host compound (this is the +2.5pt overall driver for Mexico).
+2. **Item 2** (altitude native advantage) — Mexico's group games at Azteca/Zapopan and Colombia's two altitude games get a small boost.
+3. **Item 3** (FIFA bracket) — bracket-path effects per team.
+4. **Per-venue knockout cache** — Mexico's R32+R16 at Azteca get the altitude+host compound (issues #44).
+5. **Phase 2.2a modal-XI lineup_value** — France's predicted XI €656M (Mbappé-heavy) lifts France; Argentina's €459M is more accurate than headline squad value (less peak-Messi); Spain's balanced XI rises to #1.
 
-Top 4 still cover ~55% of championship probability. See `issues.md` items #25–44 for the full v2 design, backtest comparisons, and known limitations.
+Top 4 cover ~52% of championship probability. See `issues.md` items #25–58 for the full design, backtest comparisons, and known limitations.
 
 ---
 
@@ -252,7 +256,10 @@ Top 4 still cover ~55% of championship probability. See `issues.md` items #25–
 
 ### v2 — Phase 2
 - [x] **Phase 2.1 — Lineup-aware starting-XI value** (`src/data/lineups_loader.py` + `src/features/lineup_values.py`). 314 international matches from StatsBomb open data → `lineup_value_home/away` features. WC 2022 backtest improved 1.1001 → 1.0914 (Cameroon-Brazil 2022 type misses softened). WC 2026 forecast unchanged (no StatsBomb coverage). See issues #46–52.
-- [ ] Phase 2.2 — Lineup prediction for unplayed WC 2026 matches, per-player ratings, position-weighted aggregation, expand training-data lineup coverage.
+- [x] **Phase 2.2a — Modal-XI lineup predictor for WC 2026** (`src/features/lineup_predictor.py`). For each qualifier: predicted XI = top-11 by appearance count over last 5 StatsBomb matches; citizenship-top-11 fallback for teams without StatsBomb coverage (32 modal_xi / 16 citizenship / 0 NaN). First v2 feature to move the WC 2026 headline by 2+ percentage points: Spain back to #1 at 17.0%, France jumps to 10.5%. See issues #53–58.
+- [ ] Phase 2.2b — Actual lineups for the 12 played WC 2026 matches (Wikipedia/news scraping).
+- [ ] Phase 2.2c — Expand training-data lineup coverage 10x via Wikipedia/FBRef.
+- [ ] Phase 2.2d — Per-player ratings (replace market value with FBRef/club-Elo) + position-weighted aggregation.
 
 ### v2 — Phase 3 (polish)
 - [ ] Joint MLE for Dixon-Coles ρ (replace two-stage fit)

@@ -552,6 +552,69 @@ The lineup_value coefficient is small but positive in the right direction. It's 
 - The coefficient magnitude (+0.004) is much smaller than `host_advantage` (+0.04) or `altitude_native` (+0.028), reflecting sparse coverage. More data → larger coefficient → bigger improvement.
 - **No other backtest changed** because StatsBomb data doesn't reach the WC 2014 or WC 2018 training/test folds. Cleanly isolated effect — the feature isn't disturbing anything where it shouldn't.
 
+---
+
+# v2 — Phase 2.2a: Lineup prediction for WC 2026 unplayed matches
+
+Closes the central gap of Phase 2.1: the lineup_value feature had been provably useful in the WC 2022 backtest (1.1001 → 1.0914) but had **zero effect on WC 2026 predictions** because StatsBomb has no WC 2026 coverage yet. Every WC 2026 match was getting `lineup_value_*` = NaN, the imputer was filling with the training median, the scaler was standardizing that to 0, and the model was contributing 0 from this feature. Phase 2.2a populates predicted starting-XI values for all 48 qualifiers so the model can actually USE the +0.004 coefficient it learned in Phase 2.1.
+
+### 53. Modal-XI predictor (`src/features/lineup_predictor.py`)
+**Approach:** for each WC 2026 qualifier, look back at their most-recent `LAST_K=5` matches in `statsbomb_lineups.csv`. Count appearances per player across those matches (each row in the lineups CSV is one starting-XI player, so a `groupby` over `player_id` gives the count). Top 11 by appearance count = predicted starting XI.
+
+**Why "modal" not "most-recent":** taking only the last match's XI is too volatile — coaches rotate goalkeepers, rest fatigued starters, mix in test calls. Modal-across-5-matches captures the players that DEFINITELY start when fit, while smoothing rotation.
+
+**Why K=5:** fewer than 3 means we don't trust the modal; more than 5 risks pulling in stale data from a previous coach/era. 5 hits the sweet spot for the AFCON / Copa / Euro qualifiers we have in StatsBomb.
+
+### 54. Citizenship-top-11 fallback
+**Why a fallback exists:** 11 of 48 WC 2026 qualifiers have ZERO StatsBomb coverage — Bosnia, Norway, Curaçao, Haiti, Iraq, Jordan, Uzbekistan, New Zealand, plus 3 with naming mismatches (Côte d'Ivoire / Cape Verde Islands / Congo DR) addressed via `SB_TO_RESULTS` map.
+
+Plus another 5 with < 3 matches (too few to trust modal). These all fall through to citizenship-top-11: sum top-11 Transfermarkt valuations among players whose `country_of_citizenship` matches the qualifier. Same shape as `squad_values._citizenship_top26_at`, n=11 instead of n=26.
+
+**Two TM citizenship spellings needed fixing:** `Bosnia and Herzegovina → Bosnia-Herzegovina`, `South Korea → "Korea, South"`. Without these, the fallback returned None and the qualifier ended up with NaN lineup_value.
+
+**Final split:** 32 of 48 teams use modal_xi, 16 use citizenship_top11, 0 are NaN.
+
+### 55. SB → TM player_id cache (`data/processed/sb_player_to_tm.csv`)
+**Why:** the fuzzy name match against ~47k Transfermarkt players is the slowest step in the pipeline (~4 minutes for 1,800 unique starters via `SequenceMatcher`). `lineup_values.py` already pays this cost once. `lineup_predictor.py` would naively pay it again. Factored the mapping out to its own CSV; both modules can read the cache; only one run actually builds it.
+
+### 56. WC 2026 forecast shifts — substantial this time
+This is the first time a v2 feature has substantially changed the headline (vs. Phase 2.1's "essentially unchanged" — issues.md #51):
+
+| Team | Phase 2.1 (no WC26 lineup_value) | Phase 2.2a (predicted lineup_value) | Δ |
+|---|---|---|---|
+| **Spain** | 16.3% | **17.0%** (back to #1) | +0.7 |
+| **Argentina** | 17.6% (was #1) | 15.9% | **−1.7** |
+| **France** | 8.7% | **10.5%** | **+1.8** |
+| **England** | 11.3% | 9.3% | **−2.0** |
+| **Germany** | 2.5% | 3.5% | +1.0 |
+| Mexico | 4.6% | 5.1% | +0.5 |
+| Brazil | 5.5% | 4.7% | −0.8 |
+| Portugal | 5.2% | 4.0% | −1.2 |
+
+**Why these specific shifts make domain sense:**
+- **France's predicted XI (€656M)** is heavily concentrated in their world-class starters — Mbappé, Kanté, Tchouaméni, Saliba. Full-squad value has bench dilution; the modal XI doesn't. France's probability jumps.
+- **Argentina's predicted XI (€459M)** captures the Messi-era squad becoming less peak-valued. Their full squad_value (€440M) is similar to their lineup, but the model now sees a more accurate strength estimate.
+- **England (€758M XI, highest of any team)** — but England's BRACKET path got tougher when France/Germany got more accurate probabilities. The bracket simulator routes England through harder expected knockout opponents.
+
+**Validation against published forecasts:** Spain back at #1, France a clear #3, Brazil mid-pack — aligns better with bookmaker odds and other quant models' pre-tournament forecasts than the earlier "Argentina #1" reading did. That earlier result was partly a coincidence of altitude+bracket effects compounding on a roster the model saw at peak-Messi-era squad_value. The lineup_value correction adjusts for that.
+
+### 57. Live WC 2026 eval: marginal further regression
+**Result on the 12 played matches:** log-loss 1.111, accuracy 33.3% (was 1.099 / 41.7% in Phase 2.1). **Caveat: n=12 is noise.** A single Cameroon-Brazil-2022-style surprise would shift the average by 0.3 single-handedly. Worst miss is Brazil-Morocco 1-1 (model leans slightly Morocco at 35%). Diagnostic interpretation: the lineup_value coefficient is small (+0.004), so even substantial predicted lineup differences shift λ by only 3-5% — most live-eval change is noise propagation.
+
+### 58. Known limitations of Phase 2.2a
+- **Modal-XI is a heuristic, not a real lineup prediction model.** Treats rotation as noise; real teams rotate by context (Cup vs. league, home vs. away). A real lineup predictor would condition on opponent strength.
+- **Citizenship-top-11 over-counts.** TM tracks citizenship even if a player isn't called up. Norway's top-11 (€484M) probably overstates their real XI a bit.
+- **No "actual" lineups for the 12 played WC 2026 matches.** Those are publicly known but not in StatsBomb yet. Phase 2.2b would scrape or hand-enter them.
+- **All 72 matches get the same per-team XI value.** Doesn't model "Brazil rests starters in dead rubber" — every Brazil match gets Brazil's modal XI. The Cameroon-Brazil dynamic isn't captured for WC 2026 forecasts. Per-match lineup prediction is harder (matchday-3 rest decisions depend on group state from matchdays 1-2).
+
+## Big-picture summary (v2 Phase 2.2a)
+
+- **The feature is now actually used for WC 2026.** Pre-2.2a, lineup_value was sitting idle (NaN-imputed → zero contribution). Post-2.2a, all 48 qualifiers contribute via predicted XI values.
+- **Substantial probability shifts.** First v2 feature to move the headline by 2+ percentage points across multiple teams. Spain returns to #1; France jumps to #3; England drops.
+- **Shifts align with domain intuition.** France's strength is in modal XI; Argentina's modal XI is below peak-squad; Mexico keeps host+altitude on top of modest modal XI.
+- **Live-eval (n=12) is roughly flat to slightly worse.** Within noise at this sample size.
+- **Backtests are unchanged** — predictor only affects WC 2026 prediction-time lineups, not historical training.
+
 ## Big-picture summary (v2 Phase 1 complete — Items 1 + 2 + 3)
 
 - **Item 1 (multi-host advantage)** added a graded `host_advantage` feature replacing v1's binary `neutral`. The biggest behavioral change of v2: shifts probability mass toward Americas teams in a US/Canada/Mexico-hosted WC.

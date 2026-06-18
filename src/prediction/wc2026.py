@@ -106,6 +106,20 @@ def compute_team_state_at_cutoff() -> dict[str, dict]:
             }
         state[team]["squad_value"] = float(row["squad_value_eur"])
 
+    # v2 Phase 2.2a: layer in predicted starting-XI value for each qualifier.
+    # File is produced by `python -m src.features.lineup_predictor`. If missing,
+    # we just leave lineup_value as NaN and the model's imputer fills it.
+    predicted_lineups_path = PROCESSED_DIR / "wc2026_predicted_lineup_values.csv"
+    if predicted_lineups_path.exists():
+        plv = pd.read_csv(predicted_lineups_path)
+        for _, row in plv.iterrows():
+            team = row["team"]
+            if team not in state:
+                continue
+            v = row["lineup_value_eur"]
+            if pd.notna(v):
+                state[team]["lineup_value"] = float(v)
+
     return state
 
 
@@ -155,14 +169,13 @@ def build_match_features(
         "host_advantage_away": host_advantage(away_team, match_country),
         "altitude_native_home": altitude_native_advantage(home_team, match_city),
         "altitude_native_away": altitude_native_advantage(away_team, match_city),
-        # v2 Phase 2.1: we don't have WC 2026 lineups from StatsBomb (not in
-        # their public coverage yet), so leave these NaN. The model's
-        # SimpleImputer fills with the training-set median, which after
-        # StandardScaler standardizes to 0 — meaning lineup_value contributes
-        # nothing to WC 2026 predictions. The feature only helps backtests
-        # for tournaments StatsBomb covers (WC 2022 saw −0.009 log-loss).
-        "lineup_value_home": np.nan,
-        "lineup_value_away": np.nan,
+        # v2 Phase 2.2a: predicted lineup_value from
+        # `src/features/lineup_predictor.py` (modal starting XI from each team's
+        # last 5 StatsBomb matches, or citizenship-top-11 fallback for the
+        # ~16 qualifiers with no StatsBomb coverage). If the predictor wasn't
+        # run, this falls back to NaN and the imputer handles it.
+        "lineup_value_home": h.get("lineup_value", np.nan),
+        "lineup_value_away": a.get("lineup_value", np.nan),
         "tournament_class": "world_cup",
         "is_dead_rubber": False,  # we don't know future qualification states
     }
