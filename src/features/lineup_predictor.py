@@ -51,9 +51,16 @@ TM_DIR = PROJECT_ROOT / "data" / "raw" / "transfermarkt"
 LINEUPS_PATH = PROJECT_ROOT / "data" / "raw" / "statsbomb_lineups.csv"
 ACTUAL_LINEUPS_PATH = PROJECT_ROOT / "data" / "raw" / "wc2026_actual_lineups.csv"
 SB_TO_TM_PATH = PROJECT_ROOT / "data" / "processed" / "sb_player_to_tm.csv"
+SQUAD_TO_SB_PATH = PROJECT_ROOT / "data" / "processed" / "wc2026_squad_to_sb.csv"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 OUTPUT_PATH = PROCESSED_DIR / "wc2026_predicted_lineup_values.csv"
 ACTUAL_LINEUP_VALUES_PATH = PROCESSED_DIR / "wc2026_actual_lineup_values.csv"
+
+# Phase 2.2c: minimum in-squad SB players required to trust a squad-filtered
+# modal XI. Below this, the modal XI is dominated by recently-retired or
+# uncalled-up StatsBomb starters — better to fall through to the unfiltered
+# top-11 (or the citizenship fallback if the team has thin SB coverage too).
+MIN_IN_SQUAD_FOR_FILTER = 6
 
 WC_2026_KICKOFF = date(2026, 6, 11)
 LAST_K_MATCHES = 5
@@ -118,10 +125,20 @@ def predict_starting_xi(
     team: str,
     snapshot_date: date,
     lineups: pd.DataFrame,
+    squad_filter: set[int] | None = None,
 ) -> list[int] | None:
     """Return predicted starting XI as list of StatsBomb player_ids.
 
     None if the team has fewer than 3 StatsBomb matches before snapshot_date.
+
+    `squad_filter` is the set of SB player_ids for the team's current 26-man
+    WC 2026 squad (from wc2026_squad_to_sb.csv). When provided and the team
+    has at least MIN_IN_SQUAD_FOR_FILTER matches in `recent` who are also in
+    `squad_filter`, the modal XI is restricted to those players — pads with
+    unfiltered top appearance-makers when fewer than 11 in-squad players are
+    available. When fewer than MIN_IN_SQUAD_FOR_FILTER in-squad players exist,
+    the filter is dropped (modal XI is too thinly anchored to the current
+    squad to trust) and the function falls back to the unfiltered top-11.
     """
     sb_team = next((k for k, v in SB_TO_RESULTS.items() if v == team), team)
     team_lineups = lineups[lineups["team"] == sb_team]
@@ -132,7 +149,6 @@ def predict_starting_xi(
     if n_matches < 3:
         return None
 
-    # Take the LAST_K most recent matches
     recent_match_ids = (
         team_lineups.drop_duplicates("match_id")
         .sort_values("match_date")
@@ -142,7 +158,35 @@ def predict_starting_xi(
 
     counts = recent.groupby("player_id").size().reset_index(name="n_starts")
     counts = counts.sort_values(["n_starts", "player_id"], ascending=[False, True])
+
+    if squad_filter:
+        in_squad = counts[counts["player_id"].isin(squad_filter)]
+        if len(in_squad) >= MIN_IN_SQUAD_FOR_FILTER:
+            picked = in_squad.head(11)["player_id"].astype(int).tolist()
+            if len(picked) < 11:
+                out_squad = counts[~counts["player_id"].isin(squad_filter)]
+                picked.extend(
+                    out_squad.head(11 - len(picked))["player_id"].astype(int).tolist()
+                )
+            return picked
+
     return counts.head(11)["player_id"].astype(int).tolist()
+
+
+def load_squad_filters() -> dict[str, set[int]]:
+    """Load wc2026_squad_to_sb.csv → {team → set of SB player_ids in squad}.
+
+    Returns {} if the file doesn't exist yet (lets predict_starting_xi run
+    pre-Phase-2.2c without crashing).
+    """
+    if not SQUAD_TO_SB_PATH.exists():
+        return {}
+    df = pd.read_csv(SQUAD_TO_SB_PATH)
+    df = df[df["sb_player_id"].notna()]
+    out: dict[str, set[int]] = {}
+    for team, grp in df.groupby("team"):
+        out[team] = set(grp["sb_player_id"].astype(int).tolist())
+    return out
 
 
 def predict_lineup_value(
@@ -152,12 +196,13 @@ def predict_lineup_value(
     sb_to_tm: dict[int, int | None],
     valuations_by_player: dict[int, pd.DataFrame],
     players: pd.DataFrame,
+    squad_filter: set[int] | None = None,
 ) -> tuple[float | None, int, str]:
     """Return (lineup_value_eur, n_matched_starters, source).
 
     source is "modal_xi" or "citizenship_top11".
     """
-    sb_xi = predict_starting_xi(team, snapshot_date, lineups)
+    sb_xi = predict_starting_xi(team, snapshot_date, lineups, squad_filter=squad_filter)
 
     if sb_xi is not None:
         # Modal-XI path
@@ -192,6 +237,7 @@ def build_wc2026_predictions(snapshot_date: date = WC_2026_KICKOFF) -> pd.DataFr
     valuations_by_player = _build_player_value_lookup(valuations)
 
     sb_to_tm = _build_sb_to_tm_cache(lineups, players)
+    squad_filters = load_squad_filters()
 
     # Get WC 2026 qualifiers from results.csv
     results = pd.read_csv(PROJECT_ROOT / "data" / "raw" / "results.csv")
@@ -203,6 +249,7 @@ def build_wc2026_predictions(snapshot_date: date = WC_2026_KICKOFF) -> pd.DataFr
     for team in qualifiers:
         v, n, source = predict_lineup_value(
             team, snapshot_date, lineups, sb_to_tm, valuations_by_player, players,
+            squad_filter=squad_filters.get(team),
         )
         rows.append({
             "team": team,
@@ -277,10 +324,17 @@ def build_actual_lineup_values(snapshot_date: date = WC_2026_KICKOFF) -> pd.Data
 
 
 def overlap_diagnostic() -> pd.DataFrame:
-    """For each played match, compare predicted XI to actual XI by player-name overlap.
+    """For each played match, compare predicted XI to actual XI at the SB player_id level.
 
-    Returns per-match table with predicted_xi_count, actual_xi_count, overlap_n.
-    Overall mean is the diagnostic of how good the modal-XI heuristic is.
+    Both sides are mapped through wc2026_squad_to_sb.csv first:
+      - predicted XI already comes back as SB player_ids
+      - actual XI names get mapped to SB player_ids via the same squad→SB
+        matcher used elsewhere (sorted-tokens for Asian name swaps, last-name
+        / token-subset for mononyms)
+    Overlap = |predicted_ids ∩ actual_ids|. Comparing at id level sidesteps
+    the name-format mismatch that depressed the Phase 2.2b diagnostic (e.g.
+    Korea read 0/11 only because "Heung-Min Son" ≠ "Son Heung-min" by last
+    token, not because the predictor was actually missing the player).
     """
     actual = pd.read_csv(ACTUAL_LINEUPS_PATH)
     actual["match_date"] = actual["match_date"].astype(str)
@@ -288,8 +342,16 @@ def overlap_diagnostic() -> pd.DataFrame:
     lineups = pd.read_csv(LINEUPS_PATH)
     lineups["match_date"] = pd.to_datetime(lineups["match_date"])
 
-    players = pd.read_csv(TM_DIR / "players.csv")
-    sb_to_tm = _build_sb_to_tm_cache(lineups, players)
+    squad_filters = load_squad_filters()
+
+    # Build squad→SB lookup keyed by (team, normalized squad_name) for matching
+    # actual-lineup names to SB player_ids. Uses the same wc2026_squad_to_sb.csv
+    # cache built in Phase 2.2c.
+    squad_to_sb_df = pd.read_csv(SQUAD_TO_SB_PATH) if SQUAD_TO_SB_PATH.exists() else pd.DataFrame()
+    squad_to_sb: dict[tuple[str, str], int] = {}
+    for _, r in squad_to_sb_df.iterrows():
+        if pd.notna(r["sb_player_id"]):
+            squad_to_sb[(r["team"], _normalize(r["squad_name"]))] = int(r["sb_player_id"])
 
     rows = []
     for (date_str, home, away), grp in actual.groupby(
@@ -297,46 +359,29 @@ def overlap_diagnostic() -> pd.DataFrame:
     ):
         snapshot = pd.Timestamp(date_str).date()
         for team_label, team in [("home", home), ("away", away)]:
-            actual_xi_names = set(
-                grp[grp["side"] == team_label]["player_name"]
-                .astype(str)
-                .map(_normalize)
+            actual_names = (
+                grp[grp["side"] == team_label]["player_name"].astype(str).tolist()
             )
+            actual_pids: set[int] = set()
+            for n in actual_names:
+                pid = squad_to_sb.get((team, _normalize(n)))
+                if pid is not None:
+                    actual_pids.add(pid)
 
-            # Get predicted XI for this team at the snapshot
-            sb_pids = predict_starting_xi(team, snapshot, lineups)
-            if sb_pids is None:
-                predicted_xi_names: set[str] = set()
-                source = "fallback"
-            else:
-                source = "modal_xi"
-                predicted_xi_names = set()
-                for sb_pid in sb_pids:
-                    p = lineups[lineups["player_id"] == sb_pid].iloc[0]
-                    predicted_xi_names.add(_normalize(p["player_name"]))
-
-            # Use first-word + last-word matching to handle "Christian Pulisic" vs
-            # "Christian Mate Pulisic" type variations
-            def matches(a, b):
-                if a == b:
-                    return True
-                a_parts = a.split()
-                b_parts = b.split()
-                # Last-name match if at least 2-token names
-                if a_parts and b_parts and a_parts[-1] == b_parts[-1]:
-                    return True
-                return False
-
-            overlap = sum(
-                1 for ap in actual_xi_names
-                if any(matches(ap, pp) for pp in predicted_xi_names)
+            sb_pids = predict_starting_xi(
+                team, snapshot, lineups, squad_filter=squad_filters.get(team),
             )
+            source = "modal_xi" if sb_pids is not None else "fallback"
+            predicted_pids = set(sb_pids) if sb_pids else set()
+
+            overlap = len(predicted_pids & actual_pids)
 
             rows.append({
                 "match_date": date_str,
                 "team": team,
-                "actual_count": len(actual_xi_names),
-                "predicted_count": len(predicted_xi_names),
+                "actual_count": len(actual_names),
+                "actual_mapped": len(actual_pids),
+                "predicted_count": len(predicted_pids),
                 "overlap": overlap,
                 "source": source,
             })
