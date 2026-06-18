@@ -44,12 +44,16 @@ TRAIN_START = pd.Timestamp("1990-01-01")
 MAX_GOALS = 20
 
 # Features that MUST be non-null in training (filtered via dropna before fit).
-# These are the original feature set — Elo, form, days-since-last.
+# v2: graded host_advantage_{home,away} ∈ [0,1] replaces v1's binary `neutral`.
+# v2 Item 2: altitude_native_{home,away} captures lifelong-adaptation
+# advantage at altitude venues that 2-week visitor acclimation can't match.
 NUMERIC_FEATURES_REQUIRED = [
     "home_elo_pre", "away_elo_pre",
     "home_form_scored", "home_form_conceded",
     "away_form_scored", "away_form_conceded",
     "home_days_since_last", "away_days_since_last",
+    "host_advantage_home", "host_advantage_away",
+    "altitude_native_home", "altitude_native_away",
 ]
 
 # Features that may legitimately be missing (e.g., squad value for pre-2006
@@ -57,6 +61,11 @@ NUMERIC_FEATURES_REQUIRED = [
 # Handled via median imputation inside the pipeline rather than row filtering.
 NUMERIC_FEATURES_IMPUTED = [
     "home_squad_value", "away_squad_value",
+    # v2 Phase 2.1: starting-XI value from StatsBomb lineups. Only available
+    # for ~300 international matches (WC 2018/22, Euro 20/24, Copa 24, AFCON 23).
+    # NaN for everything else (including WC 2014 — no StatsBomb coverage).
+    # Imputer fills with median, so the model still trains on all rows.
+    "lineup_value_home", "lineup_value_away",
     # NOTE: home_pts_before / away_pts_before were tried but removed — they
     # fight the is_dead_rubber signal because in dead rubbers the favorite
     # has 6 points (high) but should be softened, exactly opposite of what
@@ -64,7 +73,9 @@ NUMERIC_FEATURES_IMPUTED = [
 ]
 
 NUMERIC_FEATURES = NUMERIC_FEATURES_REQUIRED + NUMERIC_FEATURES_IMPUTED
-BOOL_FEATURES = ["neutral", "is_dead_rubber"]
+# v2: `neutral` was dropped — host_advantage_{home,away} subsumes it
+# (neutral==True ⇔ both host_advantage sides < 1.0).
+BOOL_FEATURES = ["is_dead_rubber"]
 CATEGORICAL_FEATURES = ["tournament_class"]
 
 ALL_FEATURES = NUMERIC_FEATURES + BOOL_FEATURES + CATEGORICAL_FEATURES
@@ -310,7 +321,10 @@ if __name__ == "__main__":
         "away_form_conceded": 2.0,
         "home_days_since_last": 5,
         "away_days_since_last": 5,
-        "neutral": False,
+        "host_advantage_home": 1.0,   # Argentina at home
+        "host_advantage_away": 0.7,   # Bolivia same confederation (CONMEBOL)
+        "altitude_native_home": 0.0,  # Buenos Aires is sea level
+        "altitude_native_away": 0.0,  # Bolivia not native at sea level
         "tournament_class": "qualifier",
     }])
     lam_h, lam_a = models.predict(hypo)
@@ -344,7 +358,10 @@ if __name__ == "__main__":
         "away_form_conceded": 3.5,
         "home_days_since_last": 5,
         "away_days_since_last": 5,
-        "neutral": False,
+        "host_advantage_home": 1.0,   # Brazil at home
+        "host_advantage_away": 0.0,   # San Marino: UEFA in CONMEBOL country
+        "altitude_native_home": 0.0,
+        "altitude_native_away": 0.0,
         "tournament_class": "friendly",
     }])
     lam_h, lam_a = models.predict(hypo)

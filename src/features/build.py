@@ -19,6 +19,8 @@ from pathlib import Path
 import pandas as pd
 
 from src.data.loader import PROJECT_ROOT
+from src.features.altitude import altitude_native_advantage
+from src.features.confederations import host_advantage
 from src.features.tournaments import classify_tournament
 
 
@@ -27,6 +29,7 @@ ELO_PATH = PROCESSED_DIR / "matches_with_elo.csv"
 FEATURES_PATH = PROCESSED_DIR / "features.csv"
 SQUAD_VALUES_PATH = PROCESSED_DIR / "squad_values.csv"
 GROUP_STANDINGS_PATH = PROCESSED_DIR / "group_standings.csv"
+LINEUP_VALUES_PATH = PROCESSED_DIR / "lineup_values.csv"
 
 FORM_WINDOW = 10  # matches to look back for recent form
 
@@ -151,6 +154,31 @@ def build_features(matches_with_elo: pd.DataFrame, window: int = FORM_WINDOW) ->
     df["elo_diff"] = df["home_elo_pre"] - df["away_elo_pre"]
     df["tournament_class"] = df["tournament"].apply(classify_tournament)
 
+    # v2: graded host advantage in [0, 1]. Replaces the binary `neutral` flag.
+    # 1.0 = team is in its own country; 0.7 = same confederation; 0.3 = Americas
+    # adjacency (CONMEBOL↔CONCACAF); 0.0 = elsewhere.
+    df["host_advantage_home"] = [
+        host_advantage(team, country)
+        for team, country in zip(df["home_team"], df["country"])
+    ]
+    df["host_advantage_away"] = [
+        host_advantage(team, country)
+        for team, country in zip(df["away_team"], df["country"])
+    ]
+
+    # v2 Item 2: altitude native advantage. 1.0 if team is native to the
+    # venue's altitude (lifelong adaptation that 2-week acclimation can't
+    # replicate); 0.0 otherwise. Most rows are 0 since most matches aren't
+    # at altitude.
+    df["altitude_native_home"] = [
+        altitude_native_advantage(team, city)
+        for team, city in zip(df["home_team"], df["city"])
+    ]
+    df["altitude_native_away"] = [
+        altitude_native_advantage(team, city)
+        for team, city in zip(df["away_team"], df["city"])
+    ]
+
     form = _recent_form_table(df, window)
 
     home_form = form.rename(columns={
@@ -171,8 +199,43 @@ def build_features(matches_with_elo: pd.DataFrame, window: int = FORM_WINDOW) ->
 
     df = _join_squad_values(df)
     df = _join_group_standings(df)
+    df = _join_lineup_values(df)
 
     return df
+
+
+def _join_lineup_values(features: pd.DataFrame) -> pd.DataFrame:
+    """Add lineup_value_home and lineup_value_away from StatsBomb-derived data.
+
+    Many matches won't have a lineup_value (StatsBomb covers ~300 internationals
+    from WC 2018, WC 2022, Euro 2020/2024, Copa 2024, AFCON 2023). NaN for
+    everything else — the model's SimpleImputer handles it.
+    """
+    if not LINEUP_VALUES_PATH.exists():
+        print("  (lineup_values.csv not found — skipping lineup-value join)")
+        return features
+
+    lv = pd.read_csv(LINEUP_VALUES_PATH)
+    lv["match_date"] = pd.to_datetime(lv["match_date"])
+    # Pivot: one row per match with home + away columns
+    pivot = lv.pivot_table(
+        index=["match_date", "home_team", "away_team"],
+        columns="side",
+        values="lineup_value_eur",
+        aggfunc="first",
+    ).reset_index()
+    pivot = pivot.rename(columns={
+        "home": "lineup_value_home",
+        "away": "lineup_value_away",
+        "match_date": "date",
+    })
+
+    features = features.merge(
+        pivot,
+        on=["date", "home_team", "away_team"],
+        how="left",
+    )
+    return features
 
 
 def _join_group_standings(features: pd.DataFrame) -> pd.DataFrame:

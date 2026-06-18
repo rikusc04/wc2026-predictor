@@ -2,8 +2,24 @@
 
 ML model that predicts FIFA World Cup 2026 match outcomes (W/D/L), exact scores, and win probabilities using a Poisson-style approach with Dixon-Coles correction.
 
+## Versions
+
+| Version | What's in it | Status |
+|---|---|---|
+| **v1** | Poisson regression + Dixon-Coles correction. Features: Elo, recent form, days-since-last, tournament class, squad market value (with citizenship-based fallback), dead-rubber flag, binary `neutral` venue. 20k-run Monte Carlo tournament sim. | shipped |
+| **v2 — Phase 1, Item 1** | Graded multi-host advantage feature (`host_advantage_home/away` ∈ {0.0, 0.3, 0.7, 1.0}) replaces v1's binary `neutral`. Models WC 2026's three-host CONCACAF format and the CONMEBOL↔CONCACAF Americas adjacency. | shipped |
+| **v2 — Phase 1, Item 3** | FIFA's official 48-team knockout bracket replaces the random-with-group-avoidance shortcut. Argentina overtakes Spain as the most-likely champion under fixed seeding. | shipped |
+| **v2 — Phase 1, Item 2** | Native-altitude advantage feature (binary, fires when team is lifelong-resident at the venue's altitude). Native-advantage framing rather than naive "visitor penalty," accounting for FIFA's mandatory 2-week acclimation that equalizes visitor disadvantage. | shipped |
+| **v2 — Refinements** | CAF↔AFC adjacency fixes the Qatar 2022 backtest regression. Per-venue knockout cache routes Mexico through correct host-advantage + altitude at Azteca knockouts (Mexico's P(win WC) +1.1pt). Plus a 47-check invariant suite (`tests/check_v2_invariants.py`) to catch silent-off-by-N regressions. | shipped |
+| v2 — Phase 1 follow-ups | Per-host learned home-advantage coefficients (Mexico's Azteca ≠ Liechtenstein's home crowd). | deferred |
+| **v2 — Phase 2.1** | Lineup-aware starting-XI market value (`lineup_value_home/away`) from StatsBomb open data (314 internationals: WC 2018/22, Euro 20/24, Copa 24, AFCON 23). WC 2022 backtest improved 1.1001 → 1.0914. WC 2026 forecast unchanged (no StatsBomb coverage). | shipped |
+| v2 — Phase 2.2 | Lineup prediction for unplayed WC 2026 matches; per-player ratings; position-weighted aggregation; expand lineup coverage 10x. | not started |
+| v3 | Hypothetical follow-up (calibration, tournament scope expansion). | not defined |
+
+See `issues.md` for the engineering log of both versions.
+
 ## Approach
-Predict expected goals (`λ_home`, `λ_away`) for each match using a Poisson regression on engineered features (Elo ratings, recent form, squad market value, home advantage, tournament class). From those two expected-goals numbers we derive:
+Predict expected goals (`λ_home`, `λ_away`) for each match using a Poisson regression on engineered features (Elo ratings, recent form, squad market value, host advantage, tournament class). From those two expected-goals numbers we derive:
 - W/D/L probabilities
 - Exact-score probabilities (full distribution over a 21×21 grid)
 - Tournament-level outcomes via Monte Carlo simulation
@@ -183,29 +199,37 @@ For a beginner who wants to *understand* the model, read `docs/` in order. For a
 
 ---
 
-## Headline result
+## Headline result (v2 Phase 1 + refinements)
 
 After all the work, what does the model say about WC 2026?
 
-| # | Team | P(win WC) |
-|---|---|---|
-| 1 | 🇪🇸 Spain | **18.8%** |
-| 2 | 🇦🇷 Argentina | 14.6% |
-| 3 | 🏴 England | 12.6% |
-| 4 | 🇫🇷 France | 11.5% |
-| 5 | 🇵🇹 Portugal | 4.7% |
-| 6 | 🇩🇪 Germany | 4.2% |
-| 7 | 🇳🇱 Netherlands | 4.2% |
-| 8 | 🇧🇷 Brazil | 4.1% |
-| 9 | 🇲🇦 Morocco | 3.4% |
-| ... | ... | ... |
+| # | Team | P(win WC) | Δ vs v1 |
+|---|---|---|---|
+| 1 | 🇦🇷 Argentina | **17.2%** | +2.6 (new #1) |
+| 2 | 🇪🇸 Spain | 16.8% | −2.0 |
+| 3 | 🏴 England | 11.5% | −1.1 |
+| 4 | 🇫🇷 France | 9.3% | −2.2 |
+| 5 | 🇧🇷 Brazil | 5.8% | +1.7 |
+| 6 | 🇵🇹 Portugal | 4.9% | +0.2 |
+| 7 | 🇲🇽 Mexico | **4.4%** | +2.5 |
+| 8 | 🇲🇦 Morocco | 3.5% | +0.1 |
+| 9 | 🇨🇴 Colombia | 3.3% | new top-10 |
+| 10 | 🇳🇱 Netherlands | 3.1% | −1.1 |
+| 11 | 🇩🇪 Germany | 2.8% | −1.4 |
 
-Top 4 teams cover ~57% of championship probability. Top 9 cover ~77%. About 23% probability mass is spread across the remaining 39 teams — meaningful upset potential.
+**Argentina is #1**, narrowly ahead of Spain. **Mexico now in the top 7** after the per-venue knockout cache correctly routes their R32/R16 matches through Estadio Azteca (Mexico City) where they get both host advantage AND altitude. Four effects compound across the v2 work:
+1. **Item 1** (graded host advantage + CAF↔AFC refinement) — Americas teams gain across all WC 2026 matches.
+2. **Item 2** (altitude native advantage) — Mexico's group games at Azteca/Zapopan, and Colombia's two altitude games, get a small boost.
+3. **Item 3** (FIFA bracket) — Argentina's specific bracket path is favorable; France/Germany tougher.
+4. **Per-venue knockout cache** — Mexico's R32+R16 at Azteca now get the altitude+host compound (this is the +2.5pt overall driver for Mexico).
+
+Top 4 still cover ~55% of championship probability. See `issues.md` items #25–44 for the full v2 design, backtest comparisons, and known limitations.
 
 ---
 
 ## Status
 
+### v1 (shipped)
 - [x] Project setup + dependencies
 - [x] Data acquisition (match history + Transfermarkt + Fjelstul)
 - [x] Exploratory data analysis
@@ -218,7 +242,20 @@ Top 4 teams cover ~57% of championship probability. Top 9 cover ~77%. About 23% 
 - [x] WC 2026 per-match predictions (validated on 12 played matches: log-loss 1.00)
 - [x] Monte Carlo tournament simulation (20k runs, championship probabilities)
 
-**Performance:** log-loss 0.93-1.08 on WC backtests, 1.00 on real WC 2026 matches so far — in the published academic-model range.
+**v1 performance:** log-loss 0.93–1.06 on WC 2014/18/22 backtests, 1.00 on the first 12 real WC 2026 matches — in the published academic-model range.
+
+### v2 — Phase 1
+- [x] **Item 1 — Multi-host advantage** (graded `host_advantage_home/away`, alias-normalized country names, CONMEBOL↔CONCACAF Americas adjacency). Backtest: −0.031 on WC 2014, −0.040 on WC 2018, +0.055 on WC 2022 (Qatar regression — see issues #26).
+- [x] **Item 2 — Native-altitude advantage** (`src/features/altitude.py` — binary feature: team is altitude-native if home elevation ≥ venue − 500m). Framed as native advantage rather than visitor penalty since FIFA's 2-week mandatory acclimation roughly equalizes the visitor disadvantage. Fires on 5 WC 2026 fixtures + ~900 historical training rows. See issues #36–41.
+- [x] **Item 3 — Real FIFA 48-team knockout seeding** (`src/prediction/bracket.py` encodes FIFA's bracket tree + 3rd-place eligibility matrix; chronological-order group labeling derived from fixture data). Argentina now top of championship table at 17.3%; France/Germany drop notably on tougher bracket paths. See issues #30–35.
+- [x] **Refinements** — CAF↔AFC adjacency in `confederations.py` fixes the Qatar 2022 backtest regression (1.1120 → 1.1001). Per-venue knockout cache (`KNOCKOUT_VENUES` in `bracket.py`, 4 caches in the simulator) routes Mexico through correct host + altitude at Azteca knockouts (P(win WC) 3.0% → 4.4%). Plus `tests/check_v2_invariants.py` — 47-check end-to-end smoke test. See issues #42–44.
+
+### v2 — Phase 2
+- [x] **Phase 2.1 — Lineup-aware starting-XI value** (`src/data/lineups_loader.py` + `src/features/lineup_values.py`). 314 international matches from StatsBomb open data → `lineup_value_home/away` features. WC 2022 backtest improved 1.1001 → 1.0914 (Cameroon-Brazil 2022 type misses softened). WC 2026 forecast unchanged (no StatsBomb coverage). See issues #46–52.
+- [ ] Phase 2.2 — Lineup prediction for unplayed WC 2026 matches, per-player ratings, position-weighted aggregation, expand training-data lineup coverage.
+
+### v2 — Phase 3 (polish)
+- [ ] Joint MLE for Dixon-Coles ρ (replace two-stage fit)
 
 ---
 

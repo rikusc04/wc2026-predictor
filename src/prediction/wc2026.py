@@ -24,6 +24,8 @@ import numpy as np
 import pandas as pd
 
 from src.data.loader import PROJECT_ROOT, load_results
+from src.features.altitude import altitude_native_advantage
+from src.features.confederations import host_advantage
 from src.features.tournaments import classify_tournament
 from src.models.poisson import (
     ALL_FEATURES,
@@ -111,12 +113,17 @@ def build_match_features(
     home_team: str,
     away_team: str,
     match_date: pd.Timestamp,
-    neutral: bool,
+    match_country: str,
     state: dict[str, dict],
+    match_city: str | None = None,
     days_since_override: float | None = None,
 ) -> dict:
     """Construct a single feature row for one match using the team state snapshot.
 
+    `match_country` drives the v2 Item 1 graded host-advantage features.
+    `match_city` drives the v2 Item 2 altitude-native feature (default None
+    = no city info → no altitude effect, safe for sea-level venues and for
+    the knockout cache which doesn't know individual venues).
     `days_since_override` lets callers (e.g., the knockout simulator) supply
     a fixed days-since value instead of computing it from each team's last
     pre-tournament match. Useful when predicting matches in an unfolding
@@ -144,7 +151,18 @@ def build_match_features(
         "away_days_since_last": days_since(a),
         "home_squad_value": h.get("squad_value", np.nan),
         "away_squad_value": a.get("squad_value", np.nan),
-        "neutral": bool(neutral),
+        "host_advantage_home": host_advantage(home_team, match_country),
+        "host_advantage_away": host_advantage(away_team, match_country),
+        "altitude_native_home": altitude_native_advantage(home_team, match_city),
+        "altitude_native_away": altitude_native_advantage(away_team, match_city),
+        # v2 Phase 2.1: we don't have WC 2026 lineups from StatsBomb (not in
+        # their public coverage yet), so leave these NaN. The model's
+        # SimpleImputer fills with the training-set median, which after
+        # StandardScaler standardizes to 0 — meaning lineup_value contributes
+        # nothing to WC 2026 predictions. The feature only helps backtests
+        # for tournaments StatsBomb covers (WC 2022 saw −0.009 log-loss).
+        "lineup_value_home": np.nan,
+        "lineup_value_away": np.nan,
         "tournament_class": "world_cup",
         "is_dead_rubber": False,  # we don't know future qualification states
     }
@@ -176,7 +194,8 @@ def predict_wc_2026() -> tuple[pd.DataFrame, object]:
     print("building per-match feature rows...")
     feature_rows = [
         build_match_features(
-            m["home_team"], m["away_team"], m["date"], m["neutral"], state
+            m["home_team"], m["away_team"], m["date"], m["country"], state,
+            match_city=m["city"],
         )
         for _, m in wc26.iterrows()
     ]

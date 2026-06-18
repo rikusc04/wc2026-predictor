@@ -26,6 +26,17 @@ import pandas as pd
 from src.data.loader import PROJECT_ROOT, load_results
 from src.features.group_standings import apply_match_to_standings, identify_groups
 from src.models.poisson import score_matrix
+from src.prediction.bracket import (
+    FINAL_FEEDERS,
+    GroupStandings,
+    KNOCKOUT_VENUES,
+    QF_FEEDERS,
+    R16_FEEDERS,
+    R32_MATCHUPS,
+    SF_FEEDERS,
+    build_r32_slot_to_team,
+    r32_matchups_resolved,
+)
 from src.prediction.wc2026 import (
     CUTOFF,
     build_match_features,
@@ -185,20 +196,21 @@ def simulate_tournament(
     return pd.DataFrame(rows)
 
 
-def precompute_knockout_lambdas(teams: list[str], state: dict, models) -> dict:
-    """Predict (lambda_home, lambda_away) for every possible neutral-venue
-    knockout match between WC 2026 participants. Returns dict (home, away) -> (lh, la).
+def precompute_knockout_lambdas_for_venue(
+    teams: list[str],
+    state: dict,
+    models,
+    venue_country: str,
+    venue_city: str | None,
+) -> dict[tuple[str, str], tuple[float, float]]:
+    """Predict (λ_home, λ_away) for every directed (home, away) pair at one venue.
 
-    Knockout matches are all neutral (except theoretically host country at
-    home, but we treat all as neutral for simplicity). Features:
-      - elo, form, squad value: from team state at cutoff
-      - days_since_last: 4 (typical knockout spacing)
-      - neutral: True
+    Returns dict keyed by (home, away). Used by `precompute_knockout_caches`
+    to build one cache per distinct (venue_country, venue_city) tuple that
+    appears in FIFA's knockout schedule.
     """
     rows = []
     pairs = []
-    # match_date is unused when days_since_override is set, but we still need
-    # a Timestamp to satisfy the signature.
     dummy_date = pd.Timestamp("2026-07-01")
     for h in teams:
         for a in teams:
@@ -206,21 +218,79 @@ def precompute_knockout_lambdas(teams: list[str], state: dict, models) -> dict:
                 continue
             rows.append(build_match_features(
                 home_team=h, away_team=a,
-                match_date=dummy_date, neutral=True,
-                state=state, days_since_override=4.0,
+                match_date=dummy_date,
+                match_country=venue_country,
+                match_city=venue_city,
+                state=state,
+                days_since_override=4.0,
             ))
             pairs.append((h, a))
     feats_df = pd.DataFrame(rows)
     lam_h, lam_a = models.predict(feats_df)
-    cache = {}
-    for (h, a), lh, la in zip(pairs, lam_h, lam_a):
-        cache[(h, a)] = (float(lh), float(la))
-    return cache
+    return {(h, a): (float(lh), float(la)) for (h, a), lh, la in zip(pairs, lam_h, lam_a)}
 
 
-def sample_knockout_winner(home: str, away: str, lam_cache: dict, rho: float, rng) -> str:
-    """Sample one knockout match's winner. Draws go to penalty shootout (50/50)."""
-    lh, la = lam_cache[(home, away)]
+def precompute_knockout_caches(
+    teams: list[str], state: dict, models,
+) -> dict[tuple[str, str | None], dict[tuple[str, str], tuple[float, float]]]:
+    """Build one (home, away)→(λh, λa) cache per distinct knockout venue.
+
+    v2 refinement: replaces the single "all knockouts assumed at US sea-level"
+    cache with one cache per distinct (country, city-or-None) pair in
+    `KNOCKOUT_VENUES`. WC 2026 has 4 distinct venue configurations:
+        (United States, None)   — most R32/R16/QF/SF + Final, sea level
+        (Canada, None)          — matches 83, 85, 96, sea level
+        (Mexico, None)          — match 75 (Guadalupe area), sea level
+        (Mexico, Mexico City)   — matches 79, 92, altitude (~2240m)
+
+    The cache key uses None for sub-altitude-threshold cities to keep the
+    key space small; only "Mexico City" actually matters for the altitude
+    feature. (Zapopan at 1560m is borderline — a group-stage venue, not a
+    knockout venue, so it isn't relevant here.)
+    """
+    distinct_venues: set[tuple[str, str | None]] = set()
+    for _, (city, country) in KNOCKOUT_VENUES.items():
+        # Only cities that trigger the altitude feature matter for keying;
+        # everything else collapses to (country, None).
+        from src.features.altitude import HIGH_ALTITUDE_CITIES, ALTITUDE_THRESHOLD
+        if HIGH_ALTITUDE_CITIES.get(city, 0) >= ALTITUDE_THRESHOLD:
+            distinct_venues.add((country, city))
+        else:
+            distinct_venues.add((country, None))
+
+    caches = {}
+    for country, city in sorted(distinct_venues, key=lambda x: (x[0], x[1] or "")):
+        caches[(country, city)] = precompute_knockout_lambdas_for_venue(
+            teams, state, models, country, city,
+        )
+    return caches
+
+
+def _cache_key_for_match(match_num: int) -> tuple[str, str | None]:
+    """Return the cache key (country, city-or-None) for a knockout match."""
+    city, country = KNOCKOUT_VENUES[match_num]
+    from src.features.altitude import HIGH_ALTITUDE_CITIES, ALTITUDE_THRESHOLD
+    if HIGH_ALTITUDE_CITIES.get(city, 0) >= ALTITUDE_THRESHOLD:
+        return (country, city)
+    return (country, None)
+
+
+def sample_knockout_winner(
+    match_num: int,
+    home: str,
+    away: str,
+    lam_caches: dict[tuple[str, str | None], dict],
+    rho: float,
+    rng,
+) -> str:
+    """Sample one knockout match's winner using the right per-venue cache.
+
+    `lam_caches` maps (country, city|None) → {(h, a): (λh, λa)}. We look up
+    the venue for this specific FIFA match number and use the appropriate
+    cache. Draws go to penalty shootout (50/50, per issues.md #22).
+    """
+    key = _cache_key_for_match(match_num)
+    lh, la = lam_caches[key][(home, away)]
     h, a = sample_score(lh, la, rho, rng)
     if h > a:
         return home
@@ -230,21 +300,52 @@ def sample_knockout_winner(home: str, away: str, lam_cache: dict, rho: float, rn
     return home if rng.random() < 0.5 else away
 
 
-def pair_with_group_avoidance(teams: list[str], team_to_group: dict[str, str], rng) -> list[tuple[str, str]]:
-    """Pair 32 teams into 16 matches, trying to avoid same-group meetings in R32.
+def derive_fifa_group_labels(wc26_matches: pd.DataFrame) -> dict[str, str]:
+    """Map identify_groups()'s alphabetical auto-letters to FIFA's official A→L
+    sequence by chronological order of each group's first match.
 
-    Pure constraint satisfaction isn't always possible randomly; we retry
-    a few times then fall back to whatever we have.
+    `identify_groups` labels groups A, B, C, ... by alphabetical BFS-traversal
+    of team names (whichever team is alphabetically first overall ends up in
+    its group being relabeled "A"). FIFA's official labels follow tournament
+    scheduling: Group A plays the first match (host country, traditionally),
+    Group B plays the second, and so on through Group L.
+
+    Returns: {auto_letter: fifa_letter}, e.g., {"E": "A", "A": "B", ...}.
     """
-    for _ in range(20):
-        shuffled = teams.copy()
-        rng.shuffle(shuffled)
-        pairs = [(shuffled[i], shuffled[i + 1]) for i in range(0, len(shuffled), 2)]
-        same_group = any(team_to_group[h] == team_to_group[a] for h, a in pairs)
-        if not same_group:
-            return pairs
-    # Couldn't avoid all same-group pairings; return last attempt
-    return pairs
+    auto_groups = identify_groups(wc26_matches)
+    team_to_auto = {t: letter for letter, teams in auto_groups.items() for t in teams}
+
+    # kind="stable" preserves original CSV row order within same-date ties.
+    # Within a day, the row order in results.csv reflects FIFA's match-number
+    # schedule, which is exactly what we want to use for A→L labeling.
+    sorted_matches = wc26_matches.sort_values("date", kind="stable").reset_index(drop=True)
+    fifa_order: list[str] = []
+    for _, m in sorted_matches.iterrows():
+        auto_letter = team_to_auto.get(m["home_team"])
+        if auto_letter is not None and auto_letter not in fifa_order:
+            fifa_order.append(auto_letter)
+        if len(fifa_order) == 12:
+            break
+
+    fifa_letters = list("ABCDEFGHIJKL")
+    return dict(zip(fifa_order, fifa_letters))
+
+
+def rank_third_place_qualifiers(
+    third_place_pool: list[tuple[str, int, int, int, str]],
+    n_qualifiers: int,
+    rng: np.random.Generator,
+) -> list[tuple[str, str]]:
+    """Pick the top-N 3rd-placed teams across all groups (FIFA tiebreakers).
+
+    Each item in the pool is (team, pts, gd, gf, fifa_group_letter).
+    Returns: list of (team, group_letter) for the qualifiers in rank order.
+    """
+    sorted_pool = sorted(
+        third_place_pool,
+        key=lambda x: (-x[1], -x[2], -x[3], rng.random()),
+    )
+    return [(t, g) for t, _, _, _, g in sorted_pool[:n_qualifiers]]
 
 
 def simulate_full_tournament(
@@ -261,22 +362,34 @@ def simulate_full_tournament(
     rng = np.random.default_rng(seed)
     rho = models.rho
 
-    # Identify groups
+    # Identify groups and relabel A-L to FIFA's official sequence (host
+    # nation in Group A, then by chronological order of opening matches).
     results_df, _ = load_results(apply_cutoff=False)
     results_df["date"] = pd.to_datetime(results_df["date"])
     wc26_results = results_df[
         (results_df["tournament"] == "FIFA World Cup")
         & (results_df["date"] >= CUTOFF)
     ].copy()
-    groups = identify_groups(wc26_results)
+    auto_groups = identify_groups(wc26_results)
+    auto_to_fifa = derive_fifa_group_labels(wc26_results)
+    groups = {auto_to_fifa[auto]: teams for auto, teams in auto_groups.items()}
+    print("  FIFA group assignments:")
+    for fifa_letter in "ABCDEFGHIJKL":
+        teams = groups[fifa_letter]
+        print(f"    Group {fifa_letter}: {', '.join(sorted(teams))}")
     team_to_group = {team: label for label, teams in groups.items() for team in teams}
     all_teams = sorted(set().union(*groups.values()))
 
-    # Pre-cache knockout match predictions (neutral venue)
-    print("  pre-caching knockout lambdas (~2,256 matchups, batch predict)...")
+    # Pre-cache knockout match predictions PER VENUE. WC 2026 has 4 distinct
+    # knockout venue configurations (US sea-level, Canada sea-level, Mexico
+    # sea-level, Mexico City altitude); each gets its own 2,256-entry cache.
+    print("  pre-caching knockout lambdas per venue...")
     state = compute_team_state_at_cutoff()
-    lam_cache = precompute_knockout_lambdas(all_teams, state, models)
-    print(f"  cached {len(lam_cache)} (home, away) → (λh, λa) pairs")
+    lam_caches = precompute_knockout_caches(all_teams, state, models)
+    print(f"  built {len(lam_caches)} venue caches × {len(next(iter(lam_caches.values()))):,} pairs each:")
+    for (country, city), c in lam_caches.items():
+        venue_desc = f"{city}, {country}" if city else f"{country} (sea level)"
+        print(f"    {venue_desc}: {len(c):,} entries")
 
     # Annotate played matches
     pred = predictions_df.copy()
@@ -296,8 +409,8 @@ def simulate_full_tournament(
             print(f"  simulation {sim + 1:,} / {n_sims:,}")
 
         # 1. Group stage
-        group_ranked: dict[str, list[tuple[str, int, int, int]]] = {}
-        third_place_pool: list[tuple[str, int, int, int]] = []
+        group_standings_map: dict[str, GroupStandings] = {}
+        third_place_pool: list[tuple[str, int, int, int, str]] = []
 
         for label, teams in groups.items():
             group_matches = pred[pred["home"].isin(teams) & pred["away"].isin(teams)]
@@ -315,7 +428,7 @@ def simulate_full_tournament(
                 key=lambda x: (-x[1]["pts"], -x[1]["gd"], -x[1]["gf"], rng.random()),
             )
             ranked_tuples = [(t, s["pts"], s["gd"], s["gf"]) for t, s in ranked]
-            group_ranked[label] = ranked_tuples
+            group_standings_map[label] = GroupStandings(label=label, ranked=ranked_tuples)
             for pos, (t, p, gd, gf) in enumerate(ranked_tuples):
                 if pos == 0:
                     counts[t]["group_1st"] += 1
@@ -325,56 +438,55 @@ def simulate_full_tournament(
                     counts[t]["advance"] += 1
                 elif pos == 2:
                     counts[t]["group_3rd"] += 1
-                    third_place_pool.append((t, p, gd, gf))
+                    third_place_pool.append((t, p, gd, gf, label))
                 else:
                     counts[t]["group_4th"] += 1
 
         # 2. Best-3rd-place tiebreaker → 8 qualify
-        third_place_pool.sort(key=lambda x: (-x[1], -x[2], -x[3], rng.random()))
-        qualifying_thirds = [t for t, _, _, _ in third_place_pool[:THIRD_PLACE_QUALIFIERS]]
-        for t in qualifying_thirds:
+        qualifying_thirds = rank_third_place_qualifiers(
+            third_place_pool, THIRD_PLACE_QUALIFIERS, rng,
+        )
+        qualifier_groups = [g for _, g in qualifying_thirds]
+        for t, _ in qualifying_thirds:
             counts[t]["advance"] += 1
 
-        # 3. R32 — build the 32-team bracket
-        r32_teams = []
-        for ranked in group_ranked.values():
-            r32_teams.append(ranked[0][0])
-            r32_teams.append(ranked[1][0])
-        r32_teams.extend(qualifying_thirds)
-        for t in r32_teams:
-            counts[t]["reach_r32"] += 1
+        # 3. R32 — build the FIFA bracket
+        slot_to_team = build_r32_slot_to_team(group_standings_map, qualifier_groups)
+        r32_resolved = r32_matchups_resolved(slot_to_team)
+        for _, ta, tb in r32_resolved:
+            counts[ta]["reach_r32"] += 1
+            counts[tb]["reach_r32"] += 1
 
-        # 4. R32 → R16
-        r32_pairs = pair_with_group_avoidance(r32_teams, team_to_group, rng)
-        r16_teams = [
-            sample_knockout_winner(h, a, lam_cache, rho, rng) for h, a in r32_pairs
-        ]
-        for t in r16_teams:
-            counts[t]["reach_r16"] += 1
+        # match_winners is keyed by FIFA match number (73-104). Each round
+        # we read feeders from the bracket and write winners.
+        match_winners: dict[int, str] = {}
+        for match_num, ta, tb in r32_resolved:
+            match_winners[match_num] = sample_knockout_winner(match_num, ta, tb, lam_caches, rho, rng)
+            counts[match_winners[match_num]]["reach_r16"] += 1
 
-        # 5. R16 → QF
-        rng.shuffle(r16_teams)
-        r16_pairs = [(r16_teams[i], r16_teams[i + 1]) for i in range(0, 16, 2)]
-        qf_teams = [sample_knockout_winner(h, a, lam_cache, rho, rng) for h, a in r16_pairs]
-        for t in qf_teams:
-            counts[t]["reach_qf"] += 1
+        # 4. R16 → QF (matches 89-96)
+        for match_num, (feed_a, feed_b) in R16_FEEDERS.items():
+            ta, tb = match_winners[feed_a], match_winners[feed_b]
+            match_winners[match_num] = sample_knockout_winner(match_num, ta, tb, lam_caches, rho, rng)
+            counts[match_winners[match_num]]["reach_qf"] += 1
 
-        # 6. QF → SF
-        rng.shuffle(qf_teams)
-        qf_pairs = [(qf_teams[i], qf_teams[i + 1]) for i in range(0, 8, 2)]
-        sf_teams = [sample_knockout_winner(h, a, lam_cache, rho, rng) for h, a in qf_pairs]
-        for t in sf_teams:
-            counts[t]["reach_sf"] += 1
+        # 5. QF → SF (matches 97-100)
+        for match_num, (feed_a, feed_b) in QF_FEEDERS.items():
+            ta, tb = match_winners[feed_a], match_winners[feed_b]
+            match_winners[match_num] = sample_knockout_winner(match_num, ta, tb, lam_caches, rho, rng)
+            counts[match_winners[match_num]]["reach_sf"] += 1
 
-        # 7. SF → Final
-        rng.shuffle(sf_teams)
-        sf_pairs = [(sf_teams[i], sf_teams[i + 1]) for i in range(0, 4, 2)]
-        final_teams = [sample_knockout_winner(h, a, lam_cache, rho, rng) for h, a in sf_pairs]
-        for t in final_teams:
-            counts[t]["reach_final"] += 1
+        # 6. SF → Final (matches 101-102)
+        for match_num, (feed_a, feed_b) in SF_FEEDERS.items():
+            ta, tb = match_winners[feed_a], match_winners[feed_b]
+            match_winners[match_num] = sample_knockout_winner(match_num, ta, tb, lam_caches, rho, rng)
+            counts[match_winners[match_num]]["reach_final"] += 1
 
-        # 8. Final → Champion
-        champion = sample_knockout_winner(final_teams[0], final_teams[1], lam_cache, rho, rng)
+        # 7. Final → Champion (match 104)
+        final_a, final_b = FINAL_FEEDERS
+        champion = sample_knockout_winner(
+            104, match_winners[final_a], match_winners[final_b], lam_caches, rho, rng,
+        )
         counts[champion]["win_wc"] += 1
 
     rows = []
