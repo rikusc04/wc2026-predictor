@@ -30,6 +30,7 @@ FEATURES_PATH = PROCESSED_DIR / "features.csv"
 SQUAD_VALUES_PATH = PROCESSED_DIR / "squad_values.csv"
 GROUP_STANDINGS_PATH = PROCESSED_DIR / "group_standings.csv"
 LINEUP_VALUES_PATH = PROCESSED_DIR / "lineup_values.csv"
+LINEUP_ELO_PATH = PROCESSED_DIR / "lineup_elo.csv"
 
 FORM_WINDOW = 10  # matches to look back for recent form
 
@@ -200,6 +201,7 @@ def build_features(matches_with_elo: pd.DataFrame, window: int = FORM_WINDOW) ->
     df = _join_squad_values(df)
     df = _join_group_standings(df)
     df = _join_lineup_values(df)
+    df = _join_lineup_elo(df)
 
     return df
 
@@ -227,6 +229,38 @@ def _join_lineup_values(features: pd.DataFrame) -> pd.DataFrame:
     pivot = pivot.rename(columns={
         "home": "lineup_value_home",
         "away": "lineup_value_away",
+        "match_date": "date",
+    })
+
+    features = features.merge(
+        pivot,
+        on=["date", "home_team", "away_team"],
+        how="left",
+    )
+    return features
+
+
+def _join_lineup_elo(features: pd.DataFrame) -> pd.DataFrame:
+    """Add lineup_elo_home / lineup_elo_away (v2 Phase 2.2d).
+
+    Same coverage as lineup_value (StatsBomb-tracked internationals). NaN
+    for everything else — imputer handles it.
+    """
+    if not LINEUP_ELO_PATH.exists():
+        print("  (lineup_elo.csv not found — skipping lineup-elo join)")
+        return features
+
+    le = pd.read_csv(LINEUP_ELO_PATH)
+    le["match_date"] = pd.to_datetime(le["match_date"])
+    pivot = le.pivot_table(
+        index=["match_date", "home_team", "away_team"],
+        columns="side",
+        values="lineup_elo_weighted",
+        aggfunc="first",
+    ).reset_index()
+    pivot = pivot.rename(columns={
+        "home": "lineup_elo_home",
+        "away": "lineup_elo_away",
         "match_date": "date",
     })
 

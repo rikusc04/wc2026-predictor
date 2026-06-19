@@ -66,6 +66,16 @@ NUMERIC_FEATURES_IMPUTED = [
     # NaN for everything else (including WC 2014 — no StatsBomb coverage).
     # Imputer fills with median, so the model still trains on all rows.
     "lineup_value_home", "lineup_value_away",
+    # v2 Phase 2.2d ran a diagnostic A/B against `lineup_elo_home/away`
+    # (clubelo.com per-starter Elo, position-weighted). On WC 2022 backtest:
+    #   value only:        1.091  (this config)
+    #   value + Elo:       1.118  (+0.027 — sparse-feature multicollinearity)
+    #   Elo only:          1.115  (+0.024 — Elo strictly worse than value)
+    # Club Elo turned out too coarse a proxy compared to per-player TM value,
+    # so we kept the 2.1 feature here. The 2.2d infrastructure is preserved
+    # (lineup_elo.csv, wc2026_predicted_lineup_elo.csv etc. still build) for
+    # future use as e.g. a fallback when TM value is missing, or as a
+    # multiplicative adjustment on value.
     # NOTE: home_pts_before / away_pts_before were tried but removed — they
     # fight the is_dead_rubber signal because in dead rubbers the favorite
     # has 6 points (high) but should be softened, exactly opposite of what

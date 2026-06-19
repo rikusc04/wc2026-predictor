@@ -120,6 +120,18 @@ def compute_team_state_at_cutoff() -> dict[str, dict]:
             if pd.notna(v):
                 state[team]["lineup_value"] = float(v)
 
+    # v2 Phase 2.2d: same shape, but per-team modal-XI weighted club Elo.
+    predicted_elo_path = PROCESSED_DIR / "wc2026_predicted_lineup_elo.csv"
+    if predicted_elo_path.exists():
+        ple = pd.read_csv(predicted_elo_path)
+        for _, row in ple.iterrows():
+            team = row["team"]
+            if team not in state:
+                continue
+            e = row["lineup_elo_weighted"]
+            if pd.notna(e):
+                state[team]["lineup_elo"] = float(e)
+
     return state
 
 
@@ -176,6 +188,10 @@ def build_match_features(
         # run, this falls back to NaN and the imputer handles it.
         "lineup_value_home": h.get("lineup_value", np.nan),
         "lineup_value_away": a.get("lineup_value", np.nan),
+        # v2 Phase 2.2d: position-weighted club Elo for the predicted XI.
+        # Same NaN-fallback pattern as lineup_value.
+        "lineup_elo_home": h.get("lineup_elo", np.nan),
+        "lineup_elo_away": a.get("lineup_elo", np.nan),
         "tournament_class": "world_cup",
         "is_dead_rubber": False,  # we don't know future qualification states
     }
@@ -219,13 +235,25 @@ def predict_wc_2026() -> tuple[pd.DataFrame, object]:
                 float(away_row["lineup_value_eur"].iloc[0]) if len(away_row) and pd.notna(away_row["lineup_value_eur"].iloc[0]) else None,
             )
 
+    # v2 Phase 2.2d: same override for the new lineup_elo feature.
+    actual_le_path = PROCESSED_DIR / "wc2026_actual_lineup_elo.csv"
+    actual_le: dict[tuple, tuple[float | None, float | None]] = {}
+    if actual_le_path.exists():
+        ale = pd.read_csv(actual_le_path)
+        for (mdate, h, a), grp in ale.groupby(["match_date", "home_team", "away_team"]):
+            home_row = grp[grp["side"] == "home"]
+            away_row = grp[grp["side"] == "away"]
+            actual_le[(str(mdate), h, a)] = (
+                float(home_row["lineup_elo_weighted"].iloc[0]) if len(home_row) and pd.notna(home_row["lineup_elo_weighted"].iloc[0]) else None,
+                float(away_row["lineup_elo_weighted"].iloc[0]) if len(away_row) and pd.notna(away_row["lineup_elo_weighted"].iloc[0]) else None,
+            )
+
     feature_rows = []
     for _, m in wc26.iterrows():
         feats = build_match_features(
             m["home_team"], m["away_team"], m["date"], m["country"], state,
             match_city=m["city"],
         )
-        # Override predicted lineup_value with actual when this match has been played
         key = (m["date"].strftime("%Y-%m-%d"), m["home_team"], m["away_team"])
         if key in actual_lv:
             actual_h, actual_a = actual_lv[key]
@@ -233,6 +261,12 @@ def predict_wc_2026() -> tuple[pd.DataFrame, object]:
                 feats["lineup_value_home"] = actual_h
             if actual_a is not None:
                 feats["lineup_value_away"] = actual_a
+        if key in actual_le:
+            actual_h, actual_a = actual_le[key]
+            if actual_h is not None:
+                feats["lineup_elo_home"] = actual_h
+            if actual_a is not None:
+                feats["lineup_elo_away"] = actual_a
         feature_rows.append(feats)
     features_df = pd.DataFrame(feature_rows)
 

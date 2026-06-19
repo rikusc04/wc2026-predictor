@@ -191,6 +191,35 @@ def check_features_csv() -> None:
             in_range = ((vals >= 0) & (vals <= 1)).all()
             check(f"features: {col} all values in [0, 1]", bool(in_range))
 
+    # v2 Phase 2.2d: lineup_elo_{home,away} are NOT in the production model
+    # (lost the backtest A/B vs lineup_value), but the columns must still be
+    # written to features.csv with values in clubelo's plausible range — the
+    # 2.2d infrastructure remains in place for future iteration. The column
+    # may legitimately be NaN for matches outside StatsBomb coverage.
+    full = pd.read_csv(path)
+    for col in ["lineup_elo_home", "lineup_elo_away"]:
+        if col not in full.columns:
+            check(
+                f"features: {col} column present (rebuild features.csv?)",
+                False,
+                "missing — run `python -m src.features.build`",
+            )
+            continue
+        vals = full[col].dropna()
+        if vals.empty:
+            # Possible when clubelo data hasn't been scraped yet — soft pass.
+            check(
+                f"features: {col} has no non-null rows (clubelo cache may be missing)",
+                True,
+            )
+            continue
+        in_range = ((vals >= 800) & (vals <= 2300)).all()
+        check(
+            f"features: {col} non-null values in [800, 2300] (clubelo Elo range)",
+            bool(in_range),
+            f"min={vals.min():.0f}, max={vals.max():.0f}",
+        )
+
 
 # ----------------------------------------------------------------------
 # Group 4: lookup-table sanity (catches "I forgot to rebuild features.csv")

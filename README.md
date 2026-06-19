@@ -16,8 +16,7 @@ ML model that predicts FIFA World Cup 2026 match outcomes (W/D/L), exact scores,
 | **v2 — Phase 2.2a** | Modal-XI lineup predictor for WC 2026 — each qualifier's predicted starting XI = top-11 by appearance count over last 5 StatsBomb matches; citizenship-top-11 fallback for teams with no coverage. Unlocks the lineup_value feature for the WC 2026 forecast. | shipped |
 | **v2 — Phase 2.2b** | Actual lineups for the 12 played WC 2026 matches (Wikipedia per-group pages) override predicted values. Diagnostic: modal-XI predictor matches ~35-50% of actual starters per side — informative for Phase 2.2c scoping. ALSO surfaced a bracket bug: Groups C and D were inverted since Phase 1 Item 3 (chronological inference vs FIFA seeding). Fix routes 8 teams through correct R32 slots; Spain and Argentina both rise ~1pt. | shipped |
 | **v2 — Phase 2.2c** | Squad-filter on modal-XI: WC 2026 26-man squads scraped from Wikipedia restrict the predicted starting XI to currently-rostered players. Kills the "Neymar starts for Brazil although he wasn't called up" failure mode. Squad→StatsBomb name matcher handles Korean/Japanese surname-first swap (sorted-tokens) and Portuguese mononyms (token-subset). Overlap diagnostic also rewritten to compare at player_id level instead of last-name substring — exposes the true overlap and fixes Korea-style false negatives. Mean overlap **3.9 → 5.4 / 11** across the 21 modal_xi sides in the 12 played matches; Brazil 1→7, South Korea 0→6, Ecuador 1→4. | shipped |
-| v2 — Phase 2.2d | Per-player ratings (FBRef/club-Elo) + position-weighted aggregation. | not started |
-| v3 | Hypothetical follow-up (calibration, tournament scope expansion). | not defined |
+| **v2 — Phase 2.2d** | Position-weighted club-Elo feature (`lineup_elo_home/away`) — each starter's club's Elo on match date (clubelo.com), weighted GK 0.8 / DEF 1.0 / MID 1.1 / FWD 1.2 and averaged per side. WC 2022 backtest A/B (value-only / value+Elo / Elo-only: 1.091 / 1.118 / 1.115) showed club Elo is strictly worse than TM market value — too coarse a proxy at the player level. Feature *rolled back from the production model* but the entire 2.2d data pipeline (scrape, lookup, lineup_elo.csv) stays in place for future iteration (e.g., Elo as a fallback when TM value is missing, or as a multiplicative adjustment on value). | infrastructure shipped; not in production model |
 
 See `issues.md` for the engineering log of both versions.
 
@@ -70,13 +69,16 @@ pip install -r requirements.txt
 
 If you just want to generate predictions, run these in order (~30 minutes the first time, ~1 minute on subsequent runs).
 
-### Step 1: Download source data (one-time, ~5 minutes)
+### Step 1: Download source data (one-time, ~10 minutes)
 
-These two commands download raw datasets to `data/raw/`. **Skip if already done** — the script is idempotent (it won't re-download what's already there).
+These commands download raw datasets to `data/raw/`. **Skip if already done** — each script is idempotent (won't re-download / re-scrape what's already there).
 
 ```bash
-python -m src.data.loader              # ~3 MB
-python -m src.data.squad_value_loader  # ~80 MB
+python -m src.data.loader               # results.csv + shootouts (~3 MB)
+python -m src.data.squad_value_loader   # Transfermarkt dump (~80 MB)
+python -m src.data.lineups_loader       # StatsBomb starting XIs (~3-5 min, network)
+python -m src.data.wc2026_squads        # WC 2026 26-man squads from Wikipedia (~30 sec, network)
+python -m src.data.wc2026_actual_lineups  # Hardcoded actual XIs for the 12 played WC 2026 matches (~1 sec)
 ```
 
 **Produces:**
@@ -86,18 +88,37 @@ python -m src.data.squad_value_loader  # ~80 MB
 - `data/raw/transfermarkt/players.csv` — 47k Transfermarkt player profiles
 - `data/raw/transfermarkt/player_valuations.csv` — 500k historical valuations
 - `data/raw/transfermarkt/national_teams.csv` — current team values
+- `data/raw/transfermarkt/appearances.csv` — 1.9M club-match appearance rows (drives Phase 2.2d's player→club lookup)
+- `data/raw/transfermarkt/games.csv` — club fixture list (drives Phase 2.2d's club_id→name)
 - `data/raw/wc_squads_fjelstul.csv` — historical WC squad rosters
+- `data/raw/statsbomb_lineups.csv` — Phase 2.1 starting-XI rows (WC 2018/22, Euro 20/24, Copa 24, AFCON 23)
+- `data/raw/wc2026_squads.csv` — Phase 2.2c 26-man squads, one row per (team, player)
+- `data/raw/wc2026_actual_lineups.csv` — Phase 2.2b actual starters for the 12 played WC 2026 matches
 
-### Step 2: Build features (one-time, ~25 minutes)
+### Step 2: Build features (one-time, ~30 minutes)
 
-These commands transform the raw data into the tables the model trains on. **Run them in order** — each depends on the previous one's output. **Skip if `data/processed/` is already populated**.
+These commands transform the raw data into the tables the model trains on. **Run them in this order** — later steps read CSVs produced by earlier ones. **Skip if `data/processed/` is already populated**.
 
 ```bash
-python -m src.features.elo              # ~5 sec
-python -m src.features.squad_values     # ~23 min
-python -m src.features.group_standings  # ~5 sec
-python -m src.features.build            # ~5 sec
+python -m src.features.elo               # ~5 sec
+python -m src.features.squad_values      # ~23 min  (also writes the citizenship-fallback lookup)
+python -m src.features.group_standings   # ~5 sec
+python -m src.features.lineup_values     # ~3-4 min (builds the SB→TM player cache too)
+python -m src.features.squad_to_sb       # ~10 sec  (Phase 2.2c — wc2026_squads → SB player_ids)
+python -m src.features.lineup_predictor  # ~30 sec  (modal-XI + actual-lineup overrides for WC 2026)
+python -m src.features.build             # ~5 sec   (final assembly into features.csv)
 ```
+
+**Optional — Phase 2.2d (`lineup_elo`):** to populate the club-Elo feature, run these *after* the Step 2 block above. The last two commands re-trigger `build` and `lineup_predictor` so they pick up the new column / emit the WC 2026 Elo CSVs. Pipeline still works without this block — `lineup_elo_*` just stays NaN and the model's imputer fills with the dataset median (same numbers as before 2.2d). All four are idempotent.
+
+```bash
+python -m src.data.clubelo_loader       # ~5-10 min (scrapes clubelo.com, ~500 club histories)
+python -m src.features.lineup_elo       # ~30 sec
+python -m src.features.build            # re-run so features.csv picks up lineup_elo_*
+python -m src.features.lineup_predictor # re-run so it also emits WC 2026 lineup_elo CSVs
+```
+
+After running `clubelo_loader`, eyeball `data/processed/tm_club_to_clubelo.csv` — rows with `source=fuzzy` or `unmatched` are the fuzzy-match candidates worth manually verifying before trusting their Elo signal. Corrections go in `HARDCODED_TM_TO_CLUBELO` at the top of `src/data/clubelo_loader.py`.
 
 **What each feature captures:**
 
@@ -107,6 +128,7 @@ This is where most of the engineering effort lives. The Poisson model is simple;
 - **Recent form** (built inside `build.py`) — rolling goals scored and conceded over the team's last few matches. Captures *short-run* condition that Elo is too slow to reflect (injuries, lineup churn, in-form windows).
 - **Squad market value** (`squad_values.py`) — total Transfermarkt valuation of the squad. A proxy for player quality at a level Elo can't see; Elo treats every match the same regardless of *who's actually on the pitch*.
 - **Lineup value** (loaded inside `build.py` from Phase 2.1's StatsBomb data + Phase 2.2a's modal-XI predictor + Phase 2.2c's squad filter) — refines squad value down to the *predicted starting XI* rather than the whole squad. Argentina's depth chart includes 50 internationals over a year; their starting XI is the meaningful subset.
+- **Lineup club Elo** (`lineup_elo.py`, Phase 2.2d) — position-weighted average of each starter's *club's* Elo on the match date (clubelo.com). Same modal-XI / actual-lineup machinery as `lineup_value`, but the per-player signal is the level of weekly competition the player faces at his club rather than his Transfermarkt market valuation. The two signals are complementary: market value reflects per-player talent; club Elo reflects how strong the competition is that has shaped his current form. Fixed position weights GK 0.8 / DEF 1.0 / MID 1.1 / FWD 1.2 avoid a fitting step (and the leakage risk that comes with it).
 - **Days since last match** — fatigue / freshness signal.
 - **Tournament class** (friendly / continental / World Cup) — captures the well-documented fact that teams play differently in low-stakes vs high-stakes matches.
 - **Group standings + dead-rubber flag** (`group_standings.py`) — for historical group-stage matches, identifies games where one or both teams had already secured advancement or elimination. Dead rubbers have *different goal distributions* (goalkeepers rested, B-team minutes, etc.) and the model needs to know so it doesn't treat them as full-effort data.
@@ -120,6 +142,11 @@ This is where most of the engineering effort lives. The Poisson model is simple;
 - `data/processed/final_elo.csv` — each team's final Elo rating
 - `data/processed/squad_values.csv` — team-year squad value snapshots (556 rows: 5 historical WCs × ~100 teams + 48 WC 2026 qualifiers)
 - `data/processed/group_standings.csv` — for each historical WC group match, points-before and dead-rubber flag
+- `data/processed/lineup_values.csv` — Phase 2.1 starting-XI market value, one row per (match, side)
+- `data/processed/sb_player_to_tm.csv` — cached StatsBomb→Transfermarkt player_id map (reused by 2.2a/d)
+- `data/processed/wc2026_squad_to_sb.csv` — Phase 2.2c WC 2026 squad → StatsBomb player_id map
+- `data/processed/wc2026_predicted_lineup_values.csv` — Phase 2.2a per-qualifier modal-XI value
+- `data/processed/wc2026_actual_lineup_values.csv` — Phase 2.2b per-(match, side) actual XI value for the 12 played matches
 - `data/processed/features.csv` — the final training-ready table (49k rows, 13 feature columns plus targets)
 
 ### Step 3: Train the model and predict every match (~15 seconds)
@@ -327,7 +354,7 @@ Top 4 cover ~52% of championship probability. See `issues.md` items #25–58 for
 - [x] **Phase 2.2a — Modal-XI lineup predictor for WC 2026** (`src/features/lineup_predictor.py`). For each qualifier: predicted XI = top-11 by appearance count over last 5 StatsBomb matches; citizenship-top-11 fallback for teams without StatsBomb coverage (32 modal_xi / 16 citizenship / 0 NaN). First v2 feature to move the WC 2026 headline by 2+ percentage points. See issues #53–58.
 - [x] **Phase 2.2b — Actual lineups + bracket bug fix** (`src/data/wc2026_actual_lineups.py`). 264 starter rows from Wikipedia per-group pages for the 12 played matches override predicted values. **Diagnostic finding:** modal-XI predictor matches ~35-50% of actual starters per side (informative for Phase 2.2c scoping). **Bracket bug surfaced:** Groups C and D were inverted since Phase 1 Item 3 (chronological vs FIFA seeding). Fix in `bracket.py:WC2026_FIFA_GROUPS`. See issues #59–62.
 - [x] **Phase 2.2c — WC 2026 squad filter for modal-XI** (`src/data/wc2026_squads.py` + `src/features/squad_to_sb.py`). 26-man squads scraped from Wikipedia restrict the predicted XI to currently-rostered players, killing the "Neymar starts for Brazil although he wasn't called up" failure mode. Squad→SB name matcher handles Korean/Japanese surname-first swap (sorted-tokens) and Portuguese mononyms (token-subset). Overlap diagnostic rewritten to compare at SB player_id level; mean overlap **3.9 → 5.4 / 11** across 21 modal_xi sides (Brazil 1→7, South Korea 0→6, Ecuador 1→4). See issues #63+.
-- [ ] Phase 2.2d — Per-player ratings (replace market value with FBRef/club-Elo) + position-weighted aggregation.
+- [x] **Phase 2.2d — Position-weighted club-Elo (infrastructure shipped; not in production model)** (`src/data/clubelo_loader.py` + `src/features/club_lookup.py` + `src/features/lineup_elo.py`; `lineup_predictor.py` extended for the WC 2026 paths). Pipeline: TM `appearances.csv` gives each player's club_id at any date (`merge_asof` against match_date), `clubelo.com` gives that club's Elo on that date, position-weighted average across the XI (GK 0.8 / DEF 1.0 / MID 1.1 / FWD 1.2) gives the side's `lineup_elo_weighted`. Mapping audit: 188 / 281 TM clubs matched to clubelo (67%; substring matcher on cleaned long-form names + ~30 hardcoded entries for divergent shortnames like Wolves/Wolverhampton, Gladbach/Mönchengladbach). **Backtest A/B on WC 2022:** value-only (this prod) 1.091, value + Elo 1.118 (+0.027 — sparse-feature multicollinearity on the 84 StatsBomb-covered training matches), Elo-only 1.115 (+0.024 — Elo strictly worse than value). Club Elo is too coarse a proxy compared to per-player TM market value — same club, very different individual players. `lineup_elo_{home,away}` is built into `features.csv` but NOT in `NUMERIC_FEATURES_IMPUTED`. Next attempt should try Elo as a fallback when TM value is missing, or as a multiplicative adjustment on value.
 
 ### v2 — Phase 3 (polish)
 - [ ] Joint MLE for Dixon-Coles ρ (replace two-stage fit)

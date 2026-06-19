@@ -45,6 +45,8 @@ from src.features.squad_values import (
     _player_value_at,
 )
 from src.features.lineup_values import _match_starter
+from src.features.club_lookup import _load_appearances_for, player_club_at_via_app
+from src.features.lineup_elo import EloLookup, position_group, weighted_lineup_elo
 
 
 TM_DIR = PROJECT_ROOT / "data" / "raw" / "transfermarkt"
@@ -55,6 +57,8 @@ SQUAD_TO_SB_PATH = PROJECT_ROOT / "data" / "processed" / "wc2026_squad_to_sb.csv
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 OUTPUT_PATH = PROCESSED_DIR / "wc2026_predicted_lineup_values.csv"
 ACTUAL_LINEUP_VALUES_PATH = PROCESSED_DIR / "wc2026_actual_lineup_values.csv"
+PREDICTED_LINEUP_ELO_PATH = PROCESSED_DIR / "wc2026_predicted_lineup_elo.csv"
+ACTUAL_LINEUP_ELO_PATH = PROCESSED_DIR / "wc2026_actual_lineup_elo.csv"
 
 # Phase 2.2c: minimum in-squad SB players required to trust a squad-filtered
 # modal XI. Below this, the modal XI is dominated by recently-retired or
@@ -224,6 +228,179 @@ def predict_lineup_value(
         citizenship_name, players, valuations_by_player, snapshot_date, top_n=11,
     )
     return (float(val) if val is not None else None), 11, "citizenship_top11"
+
+
+def _modal_player_position(
+    sb_player_id: int,
+    recent_lineups: pd.DataFrame,
+) -> str:
+    """Most-common StatsBomb position for a player across the rows in `recent_lineups`.
+
+    Used to bucket predicted-modal-XI players into GK/DEF/MID/FWD for the
+    Phase 2.2d position-weighted Elo aggregation. Falls back to "MID" if
+    the player never appears in `recent_lineups`.
+    """
+    rows = recent_lineups[recent_lineups["player_id"] == sb_player_id]
+    if rows.empty:
+        return "MID"
+    pos = rows["position"].mode().iat[0]
+    return position_group(pos)
+
+
+def predict_lineup_elo(
+    team: str,
+    snapshot_date: date,
+    lineups: pd.DataFrame,
+    sb_to_tm: dict[int, int | None],
+    elo: EloLookup,
+    app_index: pd.DataFrame,
+    squad_filter: set[int] | None = None,
+) -> tuple[float | None, int, str]:
+    """Return (lineup_elo_weighted, n_starters_with_elo, source) for a qualifier.
+
+    source ∈ {modal_xi, no_xi}. There's no citizenship fallback here — Elo is
+    a club-level signal and we have no clean way to synthesize a club from
+    a citizenship row, so teams with no SB coverage emit None and the
+    downstream imputer fills with the dataset median.
+    """
+    sb_xi = predict_starting_xi(team, snapshot_date, lineups, squad_filter=squad_filter)
+    if sb_xi is None:
+        return None, 0, "no_xi"
+
+    sb_team = next((k for k, v in SB_TO_RESULTS.items() if v == team), team)
+    snapshot_ts = pd.Timestamp(snapshot_date)
+    team_lineups = lineups[
+        (lineups["team"] == sb_team)
+        & (pd.to_datetime(lineups["match_date"]) < snapshot_ts)
+    ]
+    recent_match_ids = (
+        team_lineups.drop_duplicates("match_id")
+        .sort_values("match_date")
+        .tail(LAST_K_MATCHES)["match_id"]
+    )
+    recent = team_lineups[team_lineups["match_id"].isin(recent_match_ids)]
+
+    starters_data: list[tuple[float, str]] = []
+    for sb_pid in sb_xi:
+        tm_pid = sb_to_tm.get(int(sb_pid))
+        if tm_pid is None or pd.isna(tm_pid):
+            continue
+        club_id = player_club_at_via_app(int(tm_pid), snapshot_ts, app_index)
+        if club_id is None:
+            continue
+        club_elo = elo.elo_at(club_id, snapshot_ts)
+        if club_elo is None:
+            continue
+        starters_data.append((club_elo, _modal_player_position(int(sb_pid), recent)))
+
+    if not starters_data:
+        return None, 0, "modal_xi"
+    return weighted_lineup_elo(starters_data), len(starters_data), "modal_xi"
+
+
+def build_wc2026_predicted_lineup_elo(
+    snapshot_date: date = WC_2026_KICKOFF,
+) -> pd.DataFrame:
+    """Per-qualifier modal-XI weighted Elo for WC 2026 (Phase 2.2d)."""
+    lineups = pd.read_csv(LINEUPS_PATH)
+    lineups["match_date"] = pd.to_datetime(lineups["match_date"])
+    players = pd.read_csv(TM_DIR / "players.csv")
+
+    sb_to_tm = _build_sb_to_tm_cache(lineups, players)
+    squad_filters = load_squad_filters()
+    elo = EloLookup()
+
+    needed_tm_pids = {int(v) for v in sb_to_tm.values() if v is not None and not pd.isna(v)}
+    print(f"  loading appearances for {len(needed_tm_pids):,} TM players...")
+    app_index = _load_appearances_for(needed_tm_pids)
+    print(f"  {len(app_index):,} appearance rows")
+
+    results = pd.read_csv(PROJECT_ROOT / "data" / "raw" / "results.csv")
+    results["date"] = pd.to_datetime(results["date"])
+    wc26 = results[(results["date"] >= "2026-06-11") & (results["tournament"] == "FIFA World Cup")]
+    qualifiers = sorted(set(wc26["home_team"]) | set(wc26["away_team"]))
+
+    rows = []
+    for team in qualifiers:
+        elo_val, n, source = predict_lineup_elo(
+            team, snapshot_date, lineups, sb_to_tm, elo, app_index,
+            squad_filter=squad_filters.get(team),
+        )
+        rows.append({
+            "team": team,
+            "snapshot_date": snapshot_date.isoformat(),
+            "lineup_elo_weighted": elo_val,
+            "n_starters_with_elo": n,
+            "source": source,
+        })
+
+    out = pd.DataFrame(rows)
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_csv(PREDICTED_LINEUP_ELO_PATH, index=False)
+    return out
+
+
+def build_actual_lineup_elo() -> pd.DataFrame:
+    """Per-(match, side) weighted Elo for the 12 played WC 2026 matches.
+
+    Uses actual starters from data/raw/wc2026_actual_lineups.csv (which carries
+    abbreviated position strings 'GK'/'CB'/'RB'/...). Mirrors
+    `build_actual_lineup_values` for the Phase 2.2b lineup_value pipeline.
+    """
+    if not ACTUAL_LINEUPS_PATH.exists():
+        raise FileNotFoundError(
+            f"{ACTUAL_LINEUPS_PATH} not found. "
+            f"Run `python -m src.data.wc2026_actual_lineups` first."
+        )
+
+    actual = pd.read_csv(ACTUAL_LINEUPS_PATH)
+    actual["match_date"] = pd.to_datetime(actual["match_date"])
+    print(f"loaded {len(actual):,} actual starter rows from "
+          f"{actual['match_id'].nunique()} played WC 2026 matches")
+
+    players = pd.read_csv(TM_DIR / "players.csv")
+    tm_index = _build_tm_name_index(players)
+    fuzzy_candidates = list(tm_index.keys())
+    elo = EloLookup()
+
+    actual["tm_player_id"] = [
+        _match_starter(r["player_name"], r["player_nickname"] or "", tm_index, fuzzy_candidates)
+        for _, r in actual.iterrows()
+    ]
+    needed_tm_pids = {int(v) for v in actual["tm_player_id"].dropna().tolist()}
+    app_index = _load_appearances_for(needed_tm_pids)
+
+    rows = []
+    for (mdate, home, away, side), grp in actual.groupby(
+        ["match_date", "home_team", "away_team", "side"]
+    ):
+        starters_data: list[tuple[float, str]] = []
+        for _, r in grp.iterrows():
+            tm_pid = r["tm_player_id"]
+            if tm_pid is None or pd.isna(tm_pid):
+                continue
+            club_id = player_club_at_via_app(int(tm_pid), pd.Timestamp(mdate), app_index)
+            if club_id is None:
+                continue
+            club_elo = elo.elo_at(club_id, pd.Timestamp(mdate))
+            if club_elo is None:
+                continue
+            starters_data.append((club_elo, position_group(r["position"])))
+
+        rows.append({
+            "match_date": mdate.date() if hasattr(mdate, "date") else mdate,
+            "home_team": home,
+            "away_team": away,
+            "side": side,
+            "lineup_elo_weighted": weighted_lineup_elo(starters_data),
+            "n_starters_with_elo": len(starters_data),
+            "n_starters_total": len(grp),
+        })
+
+    out = pd.DataFrame(rows)
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_csv(ACTUAL_LINEUP_ELO_PATH, index=False)
+    return out
 
 
 def build_wc2026_predictions(snapshot_date: date = WC_2026_KICKOFF) -> pd.DataFrame:
@@ -410,3 +587,39 @@ if __name__ == "__main__":
     bot10 = bot10.copy()
     bot10["lineup_value_eur"] = bot10["lineup_value_eur"].apply(lambda v: f"€{v:,.0f}")
     print(bot10.to_string(index=False))
+
+    # v2 Phase 2.2d: also emit lineup_elo predictions if the clubelo cache is
+    # ready. Skipped silently otherwise — first-time setup is: run lineup_value
+    # (this script) first, then `python -m src.data.clubelo_loader`, then
+    # re-run this script.
+    tm_to_clubelo_path = PROCESSED_DIR / "tm_club_to_clubelo.csv"
+    if tm_to_clubelo_path.exists():
+        print()
+        print("=" * 60)
+        print("Phase 2.2d: building WC 2026 lineup_elo predictions...")
+        elo_df = build_wc2026_predicted_lineup_elo()
+        print(f"  wrote {PREDICTED_LINEUP_ELO_PATH.relative_to(PROJECT_ROOT)} "
+              f"({len(elo_df)} qualifiers, "
+              f"{elo_df['lineup_elo_weighted'].notna().sum()} with Elo)")
+        print()
+        print("=== sources ===")
+        print(elo_df["source"].value_counts().to_string())
+        print()
+        print("=== top 10 by predicted lineup Elo ===")
+        top_elo = (
+            elo_df.dropna(subset=["lineup_elo_weighted"])
+            .sort_values("lineup_elo_weighted", ascending=False)
+            .head(10)
+        )
+        print(top_elo.to_string(index=False))
+
+        if ACTUAL_LINEUPS_PATH.exists():
+            print()
+            print("building actual lineup_elo for 12 played WC 2026 matches...")
+            actual_df = build_actual_lineup_elo()
+            print(f"  wrote {ACTUAL_LINEUP_ELO_PATH.relative_to(PROJECT_ROOT)} "
+                  f"({len(actual_df)} rows)")
+    else:
+        print()
+        print("(skipping Phase 2.2d outputs — run "
+              "`python -m src.data.clubelo_loader` first)")
