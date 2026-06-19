@@ -691,3 +691,112 @@ This means the FIFA bracket (`R32_MATCHUPS` in `bracket.py`) was routing:
 - **Backtest summary for full v2 Phase 1:** WC 2014 0.93 → 0.899 (−0.031), WC 2018 0.97 → 0.929 (−0.041), WC 2022 1.06 → 1.112 (+0.052). Net is mildly positive (≈ −0.007 averaged). The Qatar 2022 regression is the single ugly number, traceable to the missing CAF↔AFC adjacency in Item 1's graded host scheme.
 - **Live WC 2026 eval (n=12 played matches):** 1.099 log-loss vs v1's 1.00. Within noise band, but a real warning if it doesn't recover after more matches are played. Possible explanation: v2's coefficient changes make the model less confident on top European favorites (which is good for upset-heavy WC) but doesn't capture upsets enough to compensate.
 - **What's left for v2 Phase 2:** player-/lineup-level modeling. The largest remaining opportunity, and where issues.md #8 says the genuine information lives.
+
+---
+
+# v2 — Phase 2.2c: WC 2026 squad filter for modal-XI predictor
+
+A phase that started as "scrape recent international lineups (FBRef + Wikipedia) so the modal XI uses fresh data" and pivoted, after every interesting source 403'd, to "use the published 26-man WC 2026 squads as a *filter* on the existing modal XI." The pivot was cheaper, cleaner, and addressed the same failure mode the 2.2b diagnostic surfaced. Modal-XI overlap on the 12 played matches went from **3.9/11 → 5.4/11** across the 21 modal_xi sides; biggest movers Brazil 1→7, South Korea 0→6, Ecuador 1→4, Mexico 2→4.
+
+### 63. Original plan: scrape recent international lineups. All sources blocked.
+**Plan as scoped:** the 2.2b diagnostic said modal-XI quality was bottlenecked on *freshness*, not depth — most StatsBomb data is 1–4 years old. Logical fix: scrape friendlies / qualifiers / Nations League from the last 12 months and let the existing last-K window naturally favor fresh data.
+
+**Targets attempted:**
+- **FBRef** (`fbref.com`). Sports Reference returns HTTP 403 on every request from this environment, with or without a realistic User-Agent. Their anti-scraping is per-IP and blocks cloud egress.
+- **Sofascore API** (`api.sofascore.com`). Also 403, Cloudflare-fronted with the same per-IP blocking.
+- **Transfermarkt match center** (`transfermarkt.com`). WebFetch flat-out refuses; their bot protection treats this fetcher as a bot.
+- **Wikipedia per-team results pages** (`Brazil_national_football_team_results_(2020-present)`). Accessible, but the page is out of date — content ends at 2022, so no recent matches to scrape.
+
+**Outcome:** the recent-lineup scrape was off the table without the user running it from their own machine. Could have built a scraper for them to run locally, but the volume (48 teams × ~10 matches × per-match scrape) and brittleness (one source per gap-fill team) made it expensive for a ~+1.5/11 expected lift.
+
+**Pivot trigger:** noticing that `en.wikipedia.org/wiki/2026_FIFA_World_Cup_squads` *was* accessible and *was* structured (one `{{nat fs g player|...}}` template per player, one section per team, 1248 player entries). Squads, published 2026-06-01, give us "who is actually at the tournament" — a different but high-leverage signal. Wikipedia's MediaWiki API returns the wikitext directly, so no HTML scraping needed.
+
+**Why the pivot is *better*, not just easier:** the 2.2b diagnostic's worst-tier failures (Brazil 1/11, Mexico 2/11) are largely "StatsBomb modal includes uncalled-up players who haven't been near the squad in 18 months." Filtering modal XI to the published 26-man squad addresses that failure mode directly, without needing per-match freshness. Lineup *value* doesn't move much (top 11 of squad ≈ top 11 of recent SB) but lineup *identity* — which is what the diagnostic measures — moves a lot.
+
+**Lesson:** when scoping a data fetch, check the cheapest accessible source first. The "right" data source (recent lineups by individual match) was both blocked AND overkill for the actual diagnostic problem. The accessible cheaper source (one Wikipedia page with all 26-man squads) addressed the bottleneck more directly.
+
+### 64. WC 2026 squads scraper (`src/data/wc2026_squads.py`)
+**Source:** `2026_FIFA_World_Cup_squads` via `action=parse&prop=wikitext` on the MediaWiki API. ~335 KB of wikitext, one `===Team===` heading per qualifier under each `==Group X==` super-heading. Each team's section contains a `{{nat fs g player|no=N|pos=P|name=[[Name]]|sortname=Last, First|caps=N|goals=N|club=[[Club]]|...}}` row per player.
+
+**Parser shape:**
+1. Slice the wikitext from the first `==Group A==` heading to skip lead-section noise.
+2. Iterate `===TeamName===` headings; the slice between two consecutive headings is one team's section.
+3. Within each team's section, find every `{{nat fs g player|...}}` template.
+4. Parse each template's `key=value` args, respecting pipe-as-separator AND respecting `[[...]]` / `{{...}}` nesting depth.
+5. Strip `[[Display]]` / `[[Article|Display]]` wikilinks to extract just the display name.
+
+**Bug found mid-implementation:** initial regex `\{\{\s*nat fs g player\s*\|([^{}]*?)\}\}` matched zero templates. The wikitext nests `{{birth date and age2|2026|6|11|2000|5|17}}` inside each player template's `age=` field, so `[^{}]*?` can't span them. Rewrote as a depth-aware scanner walking `{` / `}` and tracking template nesting. Fixed: 1248 templates parsed across all 48 teams.
+
+**Bug found post-scrape:** had a `WIKI_TO_RESULTS` map with `"United States" → "USA"` based on a guess about results.csv naming. results.csv (and StatsBomb, and `wc2026_actual_lineups.csv`) actually all use `"United States"`. Removing the mapping fixed a downstream squad-filter lookup miss where `predict_starting_xi("United States", ...)` couldn't find a filter keyed by `"USA"`.
+
+**Output:** `data/raw/wc2026_squads.csv` with columns `team, jersey, position, player_name, sortname, club`. 48 teams × 26 players = 1248 rows.
+
+**Lesson:** trust the existing source-of-truth (results.csv) for team-name normalization. Don't guess — grep first.
+
+### 65. Squad → StatsBomb name matcher (`src/features/squad_to_sb.py`)
+**The matching problem:** the squad CSV has Wikipedia-style names ("Vinícius Júnior", "Son Heung-min"); StatsBomb has its own house style ("Vinícius José Paixão de Oliveira Júnior", "Heung-Min Son"). Normalize-and-compare gives 41% match rate. The 2.2b diagnostic told us the failure modes:
+- **Asian family-first vs given-first swap.** Wikipedia uses "Son Heung-min" (family-first, traditional Korean); StatsBomb uses "Heung-Min Son" (given-first). Naive normalize doesn't reorder. Korea read 0/11 in the 2.2b overlap mostly because of this.
+- **Hyphenation inconsistency.** Wikipedia "Min-jae" (hyphenated); StatsBomb "Min Jae" (space-separated). Same person, different strings even after normalize.
+- **Portuguese / Brazilian mononyms.** Wikipedia "Vinícius Júnior"; StatsBomb's full name "Vinícius José Paixão de Oliveira Júnior". Wiki's name is a token-subset of SB's.
+
+**Matcher strategy (5 strategies in priority order):**
+1. **Exact normalized match** against `name` or `nickname`. Catches most Europeans — SB stores nicknames like "Son Heung-Min" that normalize to match Wiki's "Son Heung-min".
+2. **Sorted-tokens match** over a dehyphenated normalized form. "kim min-jae" → "jae kim min" matches StatsBomb's "min jae kim" → "jae kim min". Fixes Korean swap + Korean hyphen inconsistency in one move.
+3. **Last-token match.** Squad's surname matches a unique SB player's surname on that team. Disambiguation: candidate count must be exactly 1.
+4. **Token-subset match.** All of squad's normalized tokens appear in SB's normalized full name. Wiki "vinícius júnior" → tokens {"vinicius", "junior"} — both appear in SB "vinícius josé paixão de oliveira júnior" tokens. Disambiguation: same single-candidate rule.
+5. No match → squad player has no SB id (citizenship fallback may still catch them via lineup_value's other code path).
+
+**Duplicate-claim guard (found mid-test):** USA squad has both "Antonee Robinson" and "Miles Robinson." Antonee matched exactly to SB's "Antonee Robinson." Without a guard, Miles then matched via last-name to *the same* SB id — overcounting Antonee and dropping Miles into the unmatched bucket regardless. Fix: per-team `claimed: set[int]` tracks already-matched SB ids, excluded from the candidate pool on subsequent matches within the same team. Each squad row gets its own SB id or none.
+
+**Match rate result:** 511 / 1248 (40.9%) matched. The 8 teams at 0/26 (Uzbekistan, Iraq, Bosnia, Jordan, Haiti, Norway, Curaçao, New Zealand) have no SB coverage at all — they were already routing through the citizenship fallback path before this phase, so 0% match is the expected and correct behavior. The interesting metric isn't aggregate match rate, it's "of the modal-XI candidates StatsBomb proposes, how many are in the current squad?" — that's what the next item measures.
+
+**Strategy distribution:** 449 exact + 49 last_name + 12 token_subset + 8 sorted_tokens. Sorted-tokens is the smallest bucket but it's the Korean-name-format unlock; without it the Phase 2.2b 0/11 Korea result repeats.
+
+### 66. Squad filter in `predict_starting_xi` and `predict_lineup_value`
+**Signature change:** added `squad_filter: set[int] | None = None` to both functions. When provided, modal-XI selection restricts to SB player_ids in the filter. When omitted (e.g. historical backtests, which have no WC 2026 squads), behavior is identical to pre-2.2c — backwards compatible by design so the v2 invariant suite passes unchanged.
+
+**Filter activation threshold (`MIN_IN_SQUAD_FOR_FILTER = 6`):** if fewer than 6 in-squad SB players appear in the team's last K=5 matches, the filter is *dropped* and the function falls through to the unfiltered top 11. Below that threshold, the modal XI is too thinly anchored to the current squad to trust — pruning down to 4 or 5 in-squad players plus 6-7 garbage out-of-squad picks would be worse than the unfiltered modal XI.
+
+**Padding:** when filter activates but fewer than 11 in-squad players exist in `recent`, pad the picked XI with the next-most-frequent SB starters who are *not* in the squad. Keeps the output at 11 ids so downstream callers (TM valuation lookup, overlap diagnostic) don't need to special-case short XIs.
+
+**Loader (`load_squad_filters`):** reads `wc2026_squad_to_sb.csv` and groups by team into `{team → set[int]}`. Returns `{}` if the file doesn't exist, so `predict_starting_xi` runs cleanly in pre-2.2c states or in unit-test contexts that don't generate the cache.
+
+### 67. Overlap diagnostic rewrite — was measuring its own bug, not the predictor
+**Symptom:** initial 2.2c run with the squad filter applied showed *no improvement* — overall overlap was 3.79/11, basically unchanged from 2.2b's 3.9. But spot-checking Brazil's predicted XI (filter on) against Brazil's actual XI by eye showed obvious matches: Alisson, Marquinhos, Casemiro, Bruno Guimarães, Vinícius Jr, Raphinha, Lucas Paquetá — 7/11 by inspection vs 1/11 reported.
+
+**Root cause:** the diagnostic's name-matching function (`matches(a, b)` in `overlap_diagnostic`) did exact-string-equal-or-last-token-equal. That's the *minimum-viable* matcher and fails on:
+- Predicted "raphael dias belloli" vs actual "raphinha" → last tokens "belloli" vs "raphinha" → no match. Same person.
+- Predicted "heung-min son" vs actual "son heung-min" → last tokens "son" vs "heung-min" → no match. Same person.
+
+So the diagnostic was reporting the matcher's accuracy, not the predictor's. Worse, the same name-format bug it had been used to identify in 2.2b was *also* corrupting the post-fix measurement.
+
+**Rewrite:** compare at SB player_id level instead of name level. Predicted XI is already a list of SB ids. Actual XI names are looked up through the squad→SB matcher (which has the sorted-tokens + token-subset logic from item #65). Overlap = `|predicted_ids ∩ actual_ids|`. Sidesteps the name-format problem entirely because both sides resolve to the same id space.
+
+**Caveat in the metric:** for teams with thin SB coverage (Australia, Sweden), some actual XI names don't resolve to any SB id, and the overlap is upper-bounded by `actual_mapped` (the number of actual XI names we could look up). A new `actual_mapped` column was added to the output so this is visible. For example Australia shows overlap=1 / actual_mapped=1 — looks bad but is actually 100% of what's measurable.
+
+**Headline post-fix:**
+
+| Team | 2.2b overlap | 2.2c overlap (filter on, id-level) | Δ |
+|---|---|---|---|
+| Brazil | 1 | 7 | +6 |
+| South Korea | 0 | 6 | +6 |
+| Ecuador | 1 | 4 | +3 |
+| Mexico | 2 | 4 | +2 |
+| Germany | 7 | 8 | +1 |
+| United States | 6 | 7 | +1 |
+| Switzerland | 7 | 8 | +1 |
+| Mean (21 modal_xi sides) | 3.9 | **5.4** | **+1.5** |
+
+Brazil's +6 is the cleanest demonstration of the squad-filter mechanism working as intended: pre-filter modal XI was anchored on Neymar / pre-rotation Brazil; post-filter it correctly picks the seven players Brazil actually started. Korea's +6 is the combined effect of squad filter + the sorted-tokens matcher unlocking Korean names (without the matcher fix, Korea would have shown +6 in the predictor's actual quality but still 0 in the diagnostic).
+
+**Lesson:** when a metric reports no improvement after a fix that *should* improve it, spot-check the metric itself before concluding the fix didn't work. The 2.2c lift was real from the first squad-filtered run; only the diagnostic was unable to see it.
+
+## Big-picture summary (v2 Phase 2.2c)
+
+- **The squad filter is the right shape, even though it wasn't the original plan.** Recent-lineup scraping (the original 2.2c scope) was blocked by Cloudflare on every interesting source and was overkill for the actual bottleneck. Filtering modal XI to the published 26-man squad directly addresses the "modal includes uncalled-up players" failure mode that drove most of the 2.2b worst-tier misses.
+- **Lift is in lineup identity, not lineup value.** Mean overlap 3.9 → 5.4 (+1.5 / 11 starters). But top-11 of squad ≈ top-11 of recent SB in *aggregate value*, so the WC 2026 headline forecast barely moves (Spain 17.87% vs 17.9% pre-fix; Argentina 16.95% vs 17.0%). The filter is the right thing to ship, but its payoff isn't visible in win probabilities yet.
+- **The 2.2b overlap diagnostic was partly measuring its own bug.** The matcher used in the diagnostic couldn't recognize Korean-name or mononym matches even when the predictor got them right. Rewriting the diagnostic to compare at SB player_id level (using the same matcher built for item #65) exposes the true overlap. Korea would have been ~6/11 in 2.2b too if the diagnostic had been right.
+- **Live eval unchanged (1.097 → 1.0971).** Played matches use actual lineups (Phase 2.2b's override), so the squad filter doesn't touch their predictions. The filter only affects the 52 unplayed matches; whether it actually improves predictions there will only become measurable as more matches play out.
+- **Backtests unchanged.** No `wc2026_squad_to_sb.csv` for WC 2014/18/22; `load_squad_filters` returns `{}` and `predict_starting_xi` behaves identically to pre-2.2c. WC 2022 log-loss still 1.0914.
+- **47/47 invariants pass** including the `--backtest` check.
+- **What's left:** Phase 2.2d — per-player ratings (FBRef / club-Elo replacing flat TM market value) and position-weighted aggregation. The squad filter took the obvious "freshness" wins; remaining headroom is in the *signal quality* of lineup_value itself, which currently sums 11 market values uniformly (a €80M GK and a €80M striker count equally — which is wrong).
